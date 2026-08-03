@@ -227,6 +227,53 @@ func TestExecuteWebFetchAllowsWildcard(t *testing.T) {
 	}
 }
 
+// TestExecuteWebFetchRedirectDomainRecheck (M-3): every redirect hop is
+// re-checked against the allow/block lists. A 302 to a domain outside the
+// allow list must fail the fetch (502, "Fetch failed") and never return the
+// target content; a redirect staying within an allowed domain must succeed.
+// The rejected target (evil.com) is never dialed — the check fires before the
+// request is issued — so no DNS resolution is involved.
+func TestExecuteWebFetchRedirectDomainRecheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect-to-evil":
+			w.Header().Set("Location", "http://evil.com/secret")
+			w.WriteHeader(http.StatusFound)
+		case "/redirect-relative":
+			w.Header().Set("Location", "/target")
+			w.WriteHeader(http.StatusFound)
+		default:
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("SECRET TARGET CONTENT"))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := testCfg()
+	cfg.WebFetchAllowedDomains = []string{"127.0.0.1"}
+
+	// Initial request allowed (127.0.0.1), redirect to evil.com rejected.
+	r := ExecuteWebFetch(context.Background(), srv.URL+"/redirect-to-evil", cfg, nil)
+	if r.StatusCode != 502 {
+		t.Errorf("redirect rejection status = %d, want 502: %+v", r.StatusCode, r)
+	}
+	if !strings.HasPrefix(r.Content, "Fetch failed:") {
+		t.Errorf("content = %q, want \"Fetch failed: ...\"", r.Content)
+	}
+	if strings.Contains(r.Content, "SECRET TARGET CONTENT") {
+		t.Errorf("redirected content leaked: %q", r.Content)
+	}
+	if !strings.Contains(r.Content, "not in the allowed list") {
+		t.Errorf("rejection reason missing: %q", r.Content)
+	}
+
+	// In-list redirect (same host, relative Location) still follows and succeeds.
+	r = ExecuteWebFetch(context.Background(), srv.URL+"/redirect-relative", cfg, nil)
+	if r.StatusCode != 200 || r.Content != "SECRET TARGET CONTENT" {
+		t.Errorf("in-list redirect = %+v, want 200 with target content", r)
+	}
+}
+
 func TestExecuteWebFetchHTMLToText(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

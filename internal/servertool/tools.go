@@ -376,40 +376,30 @@ func ExecuteWebFetch(ctx context.Context, input string, cfg config.ServerToolCon
 		return WebFetchResult{Content: "Invalid URL", URL: input, StatusCode: 400}
 	}
 
-	if len(cfg.WebFetchAllowedDomains) > 0 {
-		allowed := false
-		for _, d := range cfg.WebFetchAllowedDomains {
-			if domainMatches(d, parsed) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			msg := fmt.Sprintf("Domain %s is not in the allowed list", parsed)
-			e := fetchEntry(input, reqHeaders, 403, msg, start)
-			e.Skipped = true
-			e.SkipReason = "domain not allowed: " + parsed
-			logFetch(log, e)
-			return WebFetchResult{Content: msg, URL: input, StatusCode: 403}
-		}
+	if kind := domainCheck(cfg, parsed); kind != domainAllowed {
+		msg := domainRejectionMessage(kind, parsed)
+		e := fetchEntry(input, reqHeaders, 403, msg, start)
+		e.Skipped = true
+		e.SkipReason = domainSkipReason(kind, parsed)
+		logFetch(log, e)
+		return WebFetchResult{Content: msg, URL: input, StatusCode: 403}
 	}
 
-	if len(cfg.WebFetchBlockedDomains) > 0 {
-		blocked := false
-		for _, d := range cfg.WebFetchBlockedDomains {
-			if domainMatches(d, parsed) {
-				blocked = true
-				break
+	// Redirect targets are re-checked against the same allow/block lists as the
+	// original URL (M-3 hardening): following a redirect into a domain the
+	// caller explicitly restricted would bypass the policy, so the fetch fails.
+	client := &http.Client{
+		Transport: httpClient.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			redirectDomain := parseDomain(req.URL.String())
+			if redirectDomain == "" {
+				return fmt.Errorf("redirect to invalid URL: %s", req.URL.String())
 			}
-		}
-		if blocked {
-			msg := fmt.Sprintf("Domain %s is blocked", parsed)
-			e := fetchEntry(input, reqHeaders, 403, msg, start)
-			e.Skipped = true
-			e.SkipReason = "domain blocked: " + parsed
-			logFetch(log, e)
-			return WebFetchResult{Content: msg, URL: input, StatusCode: 403}
-		}
+			if kind := domainCheck(cfg, redirectDomain); kind != domainAllowed {
+				return fmt.Errorf("redirect to %s: %s", redirectDomain, domainRejectionMessage(kind, redirectDomain))
+			}
+			return nil
+		},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, input, nil)
@@ -419,7 +409,7 @@ func ExecuteWebFetch(ctx context.Context, input string, cfg config.ServerToolCon
 	for k, v := range reqHeaders {
 		req.Header.Set(k, v)
 	}
-	res, err := httpClient.Do(req) // redirect: "follow" is Go's default
+	res, err := client.Do(req) // redirect: "follow" is Go's default
 	if err != nil {
 		return fetchFailed(log, input, reqHeaders, err, start)
 	}
@@ -491,6 +481,64 @@ func domainMatches(pattern, domain string) bool {
 		return domain == suffix || strings.HasSuffix(domain, "."+suffix)
 	}
 	return false
+}
+
+// domainCheckResult distinguishes the two rejection kinds so callers keep the
+// exact TS skip-reason strings.
+type domainCheckResult int
+
+const (
+	domainAllowed domainCheckResult = iota
+	domainNotAllowed
+	domainBlocked
+)
+
+// domainCheck mirrors the web_fetch allow/block policy: domainAllowed when the
+// domain passes, otherwise the rejection kind. An empty allow list permits
+// everything except explicitly blocked domains. Shared by the initial URL
+// check and the per-redirect-hop re-check (M-3).
+func domainCheck(cfg config.ServerToolConfig, domain string) domainCheckResult {
+	if len(cfg.WebFetchAllowedDomains) > 0 {
+		allowed := false
+		for _, d := range cfg.WebFetchAllowedDomains {
+			if domainMatches(d, domain) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return domainNotAllowed
+		}
+	}
+	if len(cfg.WebFetchBlockedDomains) > 0 {
+		blocked := false
+		for _, d := range cfg.WebFetchBlockedDomains {
+			if domainMatches(d, domain) {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			return domainBlocked
+		}
+	}
+	return domainAllowed
+}
+
+// domainRejectionMessage mirrors the two 403 messages of ExecuteWebFetch.
+func domainRejectionMessage(kind domainCheckResult, domain string) string {
+	if kind == domainBlocked {
+		return fmt.Sprintf("Domain %s is blocked", domain)
+	}
+	return fmt.Sprintf("Domain %s is not in the allowed list", domain)
+}
+
+// domainSkipReason mirrors the two skipReason values of ExecuteWebFetch.
+func domainSkipReason(kind domainCheckResult, domain string) string {
+	if kind == domainBlocked {
+		return "domain blocked: " + domain
+	}
+	return "domain not allowed: " + domain
 }
 
 var (
