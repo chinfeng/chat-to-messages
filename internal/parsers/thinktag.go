@@ -30,9 +30,9 @@ const (
 
 // ThinkTagParser is a streaming parser that separates text outside
 // <think>…</think> tags (TextContent) from the content inside them
-// (ThinkingContent). Thinking content is accumulated and only emitted as
-// one chunk when the closing tag arrives (or on Flush), so tag content
-// split across chunk boundaries arrives coalesced.
+// (ThinkingContent). Line-by-line port of chat-to-claude-code's
+// think_tag_parser.ts: thinking content is emitted as it arrives, only a
+// trailing fragment that could be the start of a tag is held back.
 type ThinkTagParser struct {
 	buffer     string
 	inThinkTag bool
@@ -44,23 +44,21 @@ func NewThinkTagParser() *ThinkTagParser {
 }
 
 // Feed ingests content and returns the chunks that are complete after
-// this batch. Residual partial tags and open-tag content stay buffered.
+// this batch. Residual partial tags stay buffered.
 func (p *ThinkTagParser) Feed(content string) []ContentChunk {
 	p.buffer += content
 	var chunks []ContentChunk
 	for p.buffer != "" {
 		prevLen := len(p.buffer)
 		var chunk *ContentChunk
-		var stop bool
 		if !p.inThinkTag {
-			chunk, stop = p.parseOutsideThink()
+			chunk = p.parseOutsideThink()
 		} else {
-			chunk, stop = p.parseInsideThink()
+			chunk = p.parseInsideThink()
 		}
 		if chunk != nil {
 			chunks = append(chunks, *chunk)
-		}
-		if stop || len(p.buffer) == prevLen {
+		} else if len(p.buffer) == prevLen {
 			break
 		}
 	}
@@ -68,21 +66,20 @@ func (p *ThinkTagParser) Feed(content string) []ContentChunk {
 }
 
 // parseOutsideThink processes the buffer while not inside a think tag.
-// Returns a text chunk to emit and whether the feed loop must stop.
-func (p *ThinkTagParser) parseOutsideThink() (*ContentChunk, bool) {
+func (p *ThinkTagParser) parseOutsideThink() *ContentChunk {
 	thinkStart := strings.Index(p.buffer, openTag)
 	orphanClose := strings.Index(p.buffer, closeTag)
 
 	// An orphan close tag (no open tag before it) is dropped: emit the
-	// text before it and keep whatever follows in the buffer, to be
-	// emitted as text by a later feed/flush.
+	// text before it; whatever follows stays in the buffer and is
+	// processed by the feed loop (or a later feed/flush).
 	if orphanClose != -1 && (thinkStart == -1 || orphanClose < thinkStart) {
 		preOrphan := p.buffer[:orphanClose]
 		p.buffer = p.buffer[orphanClose+len(closeTag):]
 		if preOrphan != "" {
-			return &ContentChunk{Type: TextContent, Content: preOrphan}, true
+			return &ContentChunk{Type: TextContent, Content: preOrphan}
 		}
-		return nil, true
+		return nil
 	}
 
 	if thinkStart == -1 {
@@ -97,43 +94,62 @@ func (p *ThinkTagParser) parseOutsideThink() (*ContentChunk, bool) {
 				emit := p.buffer[:lastBracket]
 				p.buffer = p.buffer[lastBracket:]
 				if emit != "" {
-					return &ContentChunk{Type: TextContent, Content: emit}, false
+					return &ContentChunk{Type: TextContent, Content: emit}
 				}
-				return nil, false
+				return nil
 			}
 		}
 		emit := p.buffer
 		p.buffer = ""
 		if emit != "" {
-			return &ContentChunk{Type: TextContent, Content: emit}, false
+			return &ContentChunk{Type: TextContent, Content: emit}
 		}
-		return nil, false
+		return nil
 	}
 
 	preThink := p.buffer[:thinkStart]
 	p.buffer = p.buffer[thinkStart+len(openTag):]
 	p.inThinkTag = true
 	if preThink != "" {
-		return &ContentChunk{Type: TextContent, Content: preThink}, false
+		return &ContentChunk{Type: TextContent, Content: preThink}
 	}
-	return nil, false
+	return nil
 }
 
 // parseInsideThink processes the buffer while inside a think tag.
-// Thinking content accumulates until the close tag arrives, so content
-// streamed in pieces is emitted as a single THINKING chunk.
-func (p *ThinkTagParser) parseInsideThink() (*ContentChunk, bool) {
+// Thinking content is emitted as it arrives; only a trailing fragment
+// that could be the start of "</think>" is held back.
+func (p *ThinkTagParser) parseInsideThink() *ContentChunk {
 	thinkEnd := strings.Index(p.buffer, closeTag)
+
 	if thinkEnd == -1 {
-		return nil, true
+		lastBracket := strings.LastIndex(p.buffer, "<")
+		if lastBracket != -1 && len(p.buffer)-lastBracket < len(closeTag) {
+			potentialTag := p.buffer[lastBracket:]
+			if strings.HasPrefix(closeTag, potentialTag) {
+				emit := p.buffer[:lastBracket]
+				p.buffer = p.buffer[lastBracket:]
+				if emit != "" {
+					return &ContentChunk{Type: ThinkingContent, Content: emit}
+				}
+				return nil
+			}
+		}
+		emit := p.buffer
+		p.buffer = ""
+		if emit != "" {
+			return &ContentChunk{Type: ThinkingContent, Content: emit}
+		}
+		return nil
 	}
+
 	thinkingContent := p.buffer[:thinkEnd]
 	p.buffer = p.buffer[thinkEnd+len(closeTag):]
 	p.inThinkTag = false
 	if thinkingContent != "" {
-		return &ContentChunk{Type: ThinkingContent, Content: thinkingContent}, false
+		return &ContentChunk{Type: ThinkingContent, Content: thinkingContent}
 	}
-	return nil, false
+	return nil
 }
 
 // Flush returns any remaining buffered content as one chunk, typed by the

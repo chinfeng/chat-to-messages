@@ -33,27 +33,35 @@ func TestThinkTagBasic(t *testing.T) {
 
 func TestThinkTagSplitAcrossChunks(t *testing.T) {
 	p := NewThinkTagParser()
+	// 裁决: 跟随 TS 逐行端口 — think 态内容随到随发，跨 chunk 的标签内容
+	// 分块输出（bun 实证 TS 产出 2 个 THINKING chunk: "deep" 与 " thought"）。
 	chunks := feedAll(t, p, "<th", "ink>", "deep", " thought", "</th", "ink>")
-	if len(chunks) != 1 {
+	if len(chunks) != 2 {
 		t.Fatalf("chunks = %d: %+v", len(chunks), chunks)
 	}
-	if chunks[0].Type != ThinkingContent || chunks[0].Content != "deep thought" {
+	if chunks[0].Type != ThinkingContent || chunks[0].Content != "deep" {
 		t.Errorf("c0 = %+v", chunks[0])
+	}
+	if chunks[1].Type != ThinkingContent || chunks[1].Content != " thought" {
+		t.Errorf("c1 = %+v", chunks[1])
 	}
 }
 
 func TestThinkTagOrphanClose(t *testing.T) {
 	p := NewThinkTagParser()
+	// 裁决: 跟随 TS 逐行端口 — orphan </think> 残余文本在 feed 内即输出
+	// （bun 实证 TS: feed 产出 ["stray ", " tag"]，flush 为 nil）。
 	chunks := feedAll(t, p, "stray </think> tag")
-	if len(chunks) != 1 {
+	if len(chunks) != 2 {
 		t.Fatalf("chunks = %d", len(chunks))
 	}
 	if chunks[0].Content != "stray " {
 		t.Errorf("c0 = %+v", chunks[0])
 	}
-	// 残余 " tag" 在 flush 时作为文本
-	fl := p.Flush()
-	if fl == nil || fl.Content != " tag" || fl.Type != TextContent {
+	if chunks[1].Content != " tag" {
+		t.Errorf("c1 = %+v", chunks[1])
+	}
+	if fl := p.Flush(); fl != nil {
 		t.Errorf("flush = %+v", fl)
 	}
 }
@@ -68,9 +76,8 @@ func TestThinkTagIncompleteTail(t *testing.T) {
 		t.Errorf("c0 = %+v", chunks[0])
 	}
 	chunks = feedAll(t, p, "ink>inside</think>after")
-	// Thinking content accumulates (see TestThinkTagSplitAcrossChunks), so
-	// this feed yields exactly two chunks: the thinking content and the
-	// trailing text. (Brief drafted len==3; the third chunk never exists.)
+	// 裁决: 跟随 TS 逐行端口 — 本 feed 恰好产出 [THINKING "inside",
+	// TEXT "after"] 两块（bun 实证 TS 行为；brief 原期望 3 块不可满足）。
 	if len(chunks) != 2 {
 		t.Fatalf("chunks2 = %d: %+v", len(chunks), chunks)
 	}
@@ -84,9 +91,16 @@ func TestThinkTagIncompleteTail(t *testing.T) {
 
 func TestThinkTagFlushInsideTag(t *testing.T) {
 	p := NewThinkTagParser()
-	feedAll(t, p, "<think>unterminated")
-	fl := p.Flush()
-	if fl == nil || fl.Type != ThinkingContent || fl.Content != "unterminated" {
+	// 裁决: 跟随 TS 逐行端口 — 无 close 标签时 think 内容在 feed 内即输出
+	// （bun 实证 TS: feed 产出 [THINKING "unterminated"]，flush 为 nil）。
+	chunks := feedAll(t, p, "<think>unterminated")
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %d: %+v", len(chunks), chunks)
+	}
+	if chunks[0].Type != ThinkingContent || chunks[0].Content != "unterminated" {
+		t.Errorf("c0 = %+v", chunks[0])
+	}
+	if fl := p.Flush(); fl != nil {
 		t.Errorf("flush = %+v", fl)
 	}
 }
@@ -176,9 +190,6 @@ func TestThinkTagTSOrphanClose(t *testing.T) {
 	var all strings.Builder
 	for _, c := range chunks {
 		all.WriteString(c.Content)
-	}
-	if fl := p.Flush(); fl != nil {
-		all.WriteString(fl.Content)
 	}
 	if !strings.Contains(all.String(), "before") || !strings.Contains(all.String(), "after") {
 		t.Errorf("all = %q", all.String())

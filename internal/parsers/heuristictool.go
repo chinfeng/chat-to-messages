@@ -152,13 +152,10 @@ func (p *HeuristicToolParser) Feed(text string) (string, []map[string]any) {
 				p.buffer = p.buffer[idx:]
 				p.state = parserStateMatchingFunction
 			} else {
-				// No ●: everything is plain text. Keep only an unclosed
-				// "<|" control-token tail in the buffer.
+				// No ● yet: only an unclosed "<|" control-token tail is
+				// split off; everything else stays buffered until flush.
 				if safePrefix := p.splitIncompleteControlTokenTail(); safePrefix != "" {
 					filteredOutputParts = append(filteredOutputParts, safePrefix)
-				} else if p.buffer != "" {
-					filteredOutputParts = append(filteredOutputParts, p.buffer)
-					p.buffer = ""
 				}
 				break
 			}
@@ -184,7 +181,6 @@ func (p *HeuristicToolParser) Feed(text string) (string, []map[string]any) {
 
 		if p.state == parserStateParsingParameters {
 			finishedToolCall := false
-			nextTool := false
 
 			for {
 				m := paramPattern.FindStringSubmatchIndex(p.buffer)
@@ -200,28 +196,25 @@ func (p *HeuristicToolParser) Feed(text string) (string, []map[string]any) {
 			}
 
 			if idx := strings.Index(p.buffer, bullet); idx != -1 {
-				// Another ● starts the next tool call; text before it is output.
+				// Another ● ends the current call and starts the next one.
 				if idx > 0 {
 					filteredOutputParts = append(filteredOutputParts, p.buffer[:idx])
 				}
 				p.buffer = p.buffer[idx:]
 				finishedToolCall = true
-				nextTool = true
-			} else if p.buffer == "" {
-				// All parameters consumed — the tool call is complete.
-				finishedToolCall = true
-			} else if !strings.HasPrefix(strings.TrimSpace(p.buffer), "<") && !strings.Contains(p.buffer, "<parameter=") {
-				// Trailing plain text after a complete tool call stays
-				// buffered and comes out on a later feed/flush.
-				finishedToolCall = true
+			} else if len(p.buffer) > 0 && !strings.HasPrefix(strings.TrimSpace(p.buffer), "<") {
+				// Trailing plain text after the last parameter: emit it and
+				// finish the current tool call.
+				if !strings.Contains(p.buffer, "<parameter=") {
+					filteredOutputParts = append(filteredOutputParts, p.buffer)
+					p.buffer = ""
+					finishedToolCall = true
+				}
 			}
 
 			if finishedToolCall && p.currentToolID != "" && p.currentFunctionName != "" {
 				detectedTools = append(detectedTools, p.buildTool())
 				p.state = parserStateText
-				if !nextTool {
-					break
-				}
 			} else {
 				break
 			}

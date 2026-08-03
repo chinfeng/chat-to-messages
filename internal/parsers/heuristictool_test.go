@@ -10,8 +10,14 @@ func TestHeuristicFunctionTool(t *testing.T) {
 	if filtered != "" {
 		t.Errorf("filtered = %q", filtered)
 	}
-	if len(tools) != 1 {
+	// 裁决: 跟随 TS 逐行端口 — 参数耗尽且 buffer 为空时不立即完成工具，
+	// 工具在 flush 时产出（bun 实证 TS: feed 返回 0 个工具）。
+	if len(tools) != 0 {
 		t.Fatalf("tools = %d", len(tools))
+	}
+	_, tools = p.Flush()
+	if len(tools) != 1 {
+		t.Fatalf("flush tools = %d", len(tools))
 	}
 	if tools[0]["name"] != "read_file" {
 		t.Errorf("name = %v", tools[0]["name"])
@@ -31,8 +37,13 @@ func TestHeuristicFunctionTool(t *testing.T) {
 func TestHeuristicMultipleParameters(t *testing.T) {
 	p := NewHeuristicToolParser()
 	_, tools := p.Feed("● <function=write_file><parameter=path>/x</parameter><parameter=content>hello</parameter>")
-	if len(tools) != 1 {
+	// 裁决: 跟随 TS 逐行端口 — 工具在 flush 时产出（bun 实证 TS 行为）。
+	if len(tools) != 0 {
 		t.Fatalf("tools = %d", len(tools))
+	}
+	_, tools = p.Flush()
+	if len(tools) != 1 {
+		t.Fatalf("flush tools = %d", len(tools))
 	}
 	in := tools[0]["input"].(map[string]any)
 	if in["path"] != "/x" || in["content"] != "hello" {
@@ -43,15 +54,16 @@ func TestHeuristicMultipleParameters(t *testing.T) {
 func TestHeuristicTextBeforeAndAfter(t *testing.T) {
 	p := NewHeuristicToolParser()
 	filtered, tools := p.Feed("prefix ● <function=read_file><parameter=path>/a</parameter> suffix")
-	if filtered != "prefix " && filtered != "prefix" {
+	// 裁决: 跟随 TS 逐行端口 — 尾部文本 " suffix" 在 feed 内随工具一起输出，
+	// 故 filtered 为 "prefix  suffix"（两个空格；bun 实证 TS 行为）。
+	if filtered != "prefix  suffix" {
 		t.Errorf("filtered = %q", filtered)
 	}
 	if len(tools) != 1 {
 		t.Fatalf("tools = %d", len(tools))
 	}
-	// 尾部 " suffix" 由下一次 feed/flush 输出
 	flText, flTools := p.Flush()
-	if flText != " suffix" && flText != "suffix" {
+	if flText != "" {
 		t.Errorf("flush text = %q", flText)
 	}
 	if len(flTools) != 0 {
@@ -85,12 +97,14 @@ func TestHeuristicWebToolJSON(t *testing.T) {
 func TestControlTokenStrip(t *testing.T) {
 	p := NewHeuristicToolParser()
 	filtered, _ := p.Feed("<|begin_of_text|>hello")
-	if filtered != "hello" {
+	// 裁决: 跟随 TS 逐行端口 — TEXT 态文本留缓冲到 flush；feed1 剥离控制
+	// 标记后 buffer="hello" 无输出（bun 实证 TS 行为）。
+	if filtered != "" {
 		t.Errorf("filtered = %q", filtered)
 	}
-	// 未完成控制标记尾巴留缓冲
+	// 未完成控制标记尾巴留缓冲，其前缀随 feed2 输出（含 feed1 的 "hello"）
 	filtered2, _ := p.Feed(" tail <|en")
-	if filtered2 != " tail " {
+	if filtered2 != "hello tail " {
 		t.Errorf("filtered2 = %q", filtered2)
 	}
 	flText, _ := p.Flush()
@@ -175,6 +189,12 @@ func TestHeuristicTSMultipleCalls(t *testing.T) {
 	}
 	if all[1]["name"] != "write_file" {
 		t.Errorf("tools[1].name = %v", all[1]["name"])
+	}
+	// 裁决补强: 跨 feed 参数附着（TS _currentParameters 跨 feed 累积）—
+	// write_file 的参数来自 feed3（bun 实证 TS 行为一致）。
+	in := all[1]["input"].(map[string]any)
+	if in["path"] != "/b" || in["content"] != "hello" {
+		t.Errorf("write_file input = %v", in)
 	}
 }
 
