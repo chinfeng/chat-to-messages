@@ -33,21 +33,18 @@ func TestMapErrorType(t *testing.T) {
 }
 
 func TestBuildMidStreamErrorSse(t *testing.T) {
-	got := BuildMidStreamErrorSse("boom")
+	// Non-retryable: api_error
+	got := BuildMidStreamErrorSse("api_error", "something went wrong")
 	if !strings.Contains(got, "event: error\n") {
-		t.Errorf("got %s", got)
+		t.Errorf("missing event header: %s", got)
 	}
-	if !strings.Contains(got, `"error":{"type":"stream_error","message":"boom"}`) {
-		t.Errorf("got %s", got)
+	if !strings.Contains(got, `"error":{"type":"api_error","message":"something went wrong"}`) {
+		t.Errorf("wrong payload: %s", got)
 	}
-	if strings.Contains(got, "overloaded_error") {
-		t.Errorf("must not be retryable: %s", got)
-	}
-}
 
-func TestBuildRetryableMidStreamErrorSse(t *testing.T) {
-	got := BuildRetryableMidStreamErrorSse("boom")
-	if !strings.Contains(got, `"message":"{\"type\":\"overloaded_error\"} boom"`) {
-		t.Errorf("retryable prefix missing: %s", got)
+	// Retryable: overloaded_error
+	got2 := BuildMidStreamErrorSse("overloaded_error", "overloaded")
+	if !strings.Contains(got2, `"error":{"type":"overloaded_error","message":"overloaded"}`) {
+		t.Errorf("wrong retryable payload: %s", got2)
 	}
 }

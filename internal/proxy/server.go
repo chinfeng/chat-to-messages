@@ -486,11 +486,13 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 				return
 			}
 			var line string
-			switch err.(type) {
+			switch e := err.(type) {
 			case *stream.UpstreamAbortedError:
-				line = sse.BuildRetryableMidStreamErrorSse(err.Error())
+				line = sse.BuildMidStreamErrorSse("overloaded_error", e.Error())
+			case *stream.UpstreamStreamError:
+				line = sse.BuildMidStreamErrorSse(sse.MapErrorType(int(e.Code)), e.Error())
 			default:
-				line = sse.BuildMidStreamErrorSse(err.Error())
+				line = sse.BuildMidStreamErrorSse("api_error", err.Error())
 			}
 			select {
 			case evCh <- line:

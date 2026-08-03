@@ -37,27 +37,16 @@ func MapErrorType(code int) string {
 	return "api_error"
 }
 
-// BuildMidStreamErrorSse builds the downstream top-level `event: error` SSE
-// line for a mid-stream failure: a stream_error-flavoured error carrying the
-// upstream failure text. No message_delta/message_stop is emitted alongside
-// it, so the turn is never disguised as completed; the client SDK throws on
-// the error event and discards the partial. By design this does NOT trigger
-// a claude-code client retry.
-func BuildMidStreamErrorSse(message string) string {
+// BuildMidStreamErrorSse builds a mid-stream `event: error` SSE line with the
+// given official Anthropic error type and message. errorType must be one of the
+// documented error types (overloaded_error, api_error, invalid_request_error,
+// rate_limit_error, etc.). No message_delta/message_stop follows the error
+// event — the client SDK throws and discards the partial.
+func BuildMidStreamErrorSse(errorType, message string) string {
 	return FormatEvent("error", errorEventData{
 		Type:  "error",
-		Error: errorEventError{Type: "stream_error", Message: message},
+		Error: errorEventError{Type: errorType, Message: message},
 	})
-}
-
-// BuildRetryableMidStreamErrorSse builds a stream_error-flavoured mid-stream
-// `event: error` that DOES trigger a claude-code client retry (for upstream
-// connection aborts). The overloaded_error marker is embedded into
-// error.message as a prefix — claude-code's retry predicate matches the
-// literal substring `{"type":"overloaded_error"}` in the SDK-built message —
-// while error.type stays stream_error so dumps/logs show the true root cause.
-func BuildRetryableMidStreamErrorSse(message string) string {
-	return BuildMidStreamErrorSse(`{"type":"overloaded_error"} ` + message)
 }
 
 // FormatEvent renders one SSE event as `event: <type>\ndata: <json>\n\n`.

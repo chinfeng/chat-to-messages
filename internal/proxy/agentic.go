@@ -778,11 +778,13 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 	if err := inner.Err(); err != nil {
 		if r.Context().Err() == nil {
 			var line string
-			switch err.(type) {
+			switch e := err.(type) {
 			case *stream.UpstreamAbortedError:
-				line = sse.BuildRetryableMidStreamErrorSse(err.Error())
+				line = sse.BuildMidStreamErrorSse("overloaded_error", e.Error())
+			case *stream.UpstreamStreamError:
+				line = sse.BuildMidStreamErrorSse(sse.MapErrorType(int(e.Code)), e.Error())
 			default:
-				line = sse.BuildMidStreamErrorSse(err.Error())
+				line = sse.BuildMidStreamErrorSse("api_error", err.Error())
 			}
 			emit(line)
 		}

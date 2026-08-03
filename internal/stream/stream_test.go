@@ -263,26 +263,26 @@ func TestStreamUsageFallbackDetails(t *testing.T) {
 }
 
 func TestStreamUpstreamErrorObject(t *testing.T) {
-	// 用户裁决 2026-08-03（第三次确认跟随 TS）：TS catch 块对两种错误类型
-	// 处理相同——hadContent → notice + message_delta/message_stop 优雅收尾，
-	// 生成器正常结束（Err() 为 nil），不 rethrow；仅无内容时才由 Err() 携带
-	// 错误。已用 bun 运行 TS 参考实现验证（error after content → 不抛）。
-	// brief 原断言（Err() 返回 UpstreamStreamError）与 TS 不符，按裁决修正。
+	// Mid-stream error object after content: hadContent → Err() surfaces
+	// UpstreamStreamError so the route layer emits `event: error` (stream_error)
+	// per the Anthropic Messages streaming protocol. No message_delta/message_stop
+	// — the error event terminates the stream.
 	body := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" +
 		"data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n"
 	chunks := chunksFromSSE(t, body)
 	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
 	ev, err := collect(t, st)
-	if err != nil {
-		t.Fatalf("hadContent → graceful completion, err = %v", err)
+	if err == nil {
+		t.Fatal("hadContent → Err() must surface UpstreamStreamError")
 	}
-	// 已有内容 → incomplete notice 分支
+	var usErr *UpstreamStreamError
+	if !errors.As(err, &usErr) || usErr.Code != 429 {
+		t.Fatalf("err = %v", err)
+	}
+	// Events must NOT include message_delta or message_stop.
 	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, "API Error: Server error mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", joined)
-	}
-	if !strings.Contains(joined, "message_delta") || !strings.Contains(joined, "message_stop") {
-		t.Errorf("turn must complete gracefully: %s", joined)
+	if strings.Contains(joined, "message_delta") || strings.Contains(joined, "message_stop") {
+		t.Errorf("no lifecycle events after error: %s", joined)
 	}
 }
 
@@ -324,7 +324,7 @@ func TestStreamUpstreamErrorStringCode(t *testing.T) {
 	if !errors.As(err, &usErr) {
 		t.Fatalf("err = %T, want *UpstreamStreamError", err)
 	}
-	if usErr.Message != "rate limited" || usErr.Code != 500 {
+	if !strings.Contains(usErr.Message, "Server error mid-response") || usErr.Code != 500 {
 		t.Errorf("stream error = %+v, want code 500 (string-code fallback)", usErr)
 	}
 	if len(ev) != 1 {
@@ -372,15 +372,17 @@ func TestStreamConnectionClosedMidStream(t *testing.T) {
 	}
 	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
 	ev, err := collect(t, st)
-	if err != nil {
-		t.Fatalf("content existed → graceful completion, err = %v", err)
+	if err == nil {
+		t.Fatal("hadContent → Err() must surface UpstreamAbortedError")
 	}
+	var ab *UpstreamAbortedError
+	if !errors.As(err, &ab) || ab.Subtype != "connection_closed" {
+		t.Fatalf("err = %v", err)
+	}
+	// Events must NOT include message_delta or message_stop.
 	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, "API Error: Connection closed mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", joined)
-	}
-	if !strings.Contains(joined, "message_stop") {
-		t.Errorf("must complete gracefully: %s", joined)
+	if strings.Contains(joined, "message_delta") || strings.Contains(joined, "message_stop") {
+		t.Errorf("no lifecycle events after error: %s", joined)
 	}
 }
 
@@ -480,21 +482,6 @@ func TestExtractUsageInfo(t *testing.T) {
 	}
 	if ExtractUsageInfo(nil) != nil {
 		t.Error("nil usage → nil")
-	}
-}
-
-func TestBuildIncompleteNotice(t *testing.T) {
-	if got := BuildIncompleteNotice(&UpstreamStreamError{}); !strings.Contains(got, "Server error mid-response") {
-		t.Errorf("got %q", got)
-	}
-	if got := BuildIncompleteNotice(&UpstreamAbortedError{Subtype: "connection_closed"}); !strings.Contains(got, "Connection closed mid-response") {
-		t.Errorf("got %q", got)
-	}
-	if got := BuildIncompleteNotice(&UpstreamAbortedError{Subtype: "response_stalled"}); !strings.Contains(got, "Response stalled mid-stream") {
-		t.Errorf("got %q", got)
-	}
-	if got := BuildIncompleteNotice(errors.New("x")); !strings.Contains(got, "Response stalled mid-stream") {
-		t.Errorf("got %q", got)
 	}
 }
 
@@ -668,16 +655,16 @@ func TestStreamToolCallsChunks(t *testing.T) {
 
 func TestStreamErrorClosesOpenBlocks(t *testing.T) {
 	// reasoning_content eagerly opens a thinking block; an upstream read error
-	// must leave a well-formed block prefix (starts balanced by stops).
+	// must leave a well-formed block prefix (starts balanced by stops) and
+	// surface the error.
 	chunks := []openai.Chunk{
 		{Choices: []openai.Choice{{Delta: &openai.Delta{ReasoningContent: strPtr("thinking...")}}}},
 		{Err: errors.New("upstream disconnected")},
 	}
 	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "gpt-4o"), 10, true, nil, nil)
 	ev, err := collect(t, st)
-	// reasoning was emitted → hadContent → graceful completion (abort swallowed)
-	if err != nil {
-		t.Fatalf("err = %v", err)
+	if err == nil {
+		t.Fatal("hadContent → Err() must surface error")
 	}
 	joined := strings.Join(ev, "\n")
 	starts := strings.Count(joined, "event: content_block_start")

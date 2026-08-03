@@ -607,14 +607,11 @@ func TestUpstreamAbortSurfacesStreamError(t *testing.T) {
 	}
 	parsed := eventData(events, "error")
 	errObj, _ := parsed["error"].(map[string]any)
-	if errObj == nil || errObj["type"] != "stream_error" {
+	if errObj == nil || errObj["type"] != "overloaded_error" {
 		t.Errorf("error.type = %v", errObj)
 	}
-	msg, _ := errObj["message"].(string)
-	if !strings.Contains(msg, `"type":"overloaded_error"`) {
-		t.Errorf("retry-trigger substring missing: %q", msg)
-	}
-	if !strings.Contains(msg, "Upstream stream ended without a finish_reason") {
+		msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "Connection closed mid-response. The response above may be incomplete") {
 		t.Errorf("message = %q", msg)
 	}
 	// The error must NOT be disguised as assistant text, and the turn must NOT
@@ -630,7 +627,7 @@ func TestUpstreamAbortSurfacesStreamError(t *testing.T) {
 	}
 }
 
-func TestIncompleteNoticeAfterConnectionDrop(t *testing.T) {
+func TestErrorEventAfterConnectionDrop(t *testing.T) {
 	up := mockUpstreamAbort(t, "data: {\"id\":\"chatcmpl-conn\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n")
 	h := NewHandler(testConfig(up.URL))
 	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
@@ -639,21 +636,22 @@ func TestIncompleteNoticeAfterConnectionDrop(t *testing.T) {
 	if !strings.Contains(s, "Hello") {
 		t.Errorf("content missing: %s", s)
 	}
-	if !strings.Contains(s, "API Error: Connection closed mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", s)
-	}
 	types := eventTypes(parseSSE(t, s))
-	for _, want := range []string{"message_start", "message_delta", "message_stop"} {
-		if !contains(types, want) {
-			t.Errorf("missing %s in %v", want, types)
-		}
+	if !contains(types, "error") {
+		t.Fatalf("error event missing: %v\nbody = %s", types, s)
 	}
-	if contains(types, "error") {
-		t.Errorf("unexpected error event: %v", types)
+	parsed := eventData(parseSSE(t, s), "error")
+	errObj, _ := parsed["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "overloaded_error" {
+		t.Errorf("error.type = %v", errObj)
+	}
+	// No message_delta/message_stop after the error event.
+	if contains(types, "message_delta") || contains(types, "message_stop") {
+		t.Errorf("no lifecycle events after error: %v", types)
 	}
 }
 
-func TestIncompleteNoticeAfterEmbeddedError(t *testing.T) {
+func TestErrorEventAfterEmbeddedError(t *testing.T) {
 	sseBody := "data: {\"id\":\"chatcmpl-err\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial output\"},\"finish_reason\":null}]}\n\n" +
 		"data: {\"id\":\"chatcmpl-err\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"error\":{\"message\":\"Server overloaded\",\"code\":529},\"choices\":[]}\n\n"
 	up := mockUpstream(t, sseBody, 200)
@@ -664,19 +662,22 @@ func TestIncompleteNoticeAfterEmbeddedError(t *testing.T) {
 	if !strings.Contains(s, "partial output") {
 		t.Errorf("content missing: %s", s)
 	}
-	if !strings.Contains(s, "API Error: Server error mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", s)
-	}
 	types := eventTypes(parseSSE(t, s))
-	if !contains(types, "message_delta") || !contains(types, "message_stop") {
-		t.Errorf("turn must complete gracefully: %v", types)
+	if !contains(types, "error") {
+		t.Fatalf("error event missing: %v\nbody = %s", types, s)
 	}
-	if contains(types, "error") {
-		t.Errorf("unexpected error event: %v", types)
+	parsed := eventData(parseSSE(t, s), "error")
+	errObj, _ := parsed["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "overloaded_error" {
+		t.Errorf("error.type = %v", errObj)
+	}
+	// No message_delta/message_stop after the error event.
+	if contains(types, "message_delta") || contains(types, "message_stop") {
+		t.Errorf("no lifecycle events after error: %v", types)
 	}
 }
 
-func TestIncompleteNoticeAfterStall(t *testing.T) {
+func TestErrorEventAfterStall(t *testing.T) {
 	// Content, then a clean EOF with no finish_reason and no [DONE] — the
 	// response_stalled path.
 	up := mockUpstream(t, "data: {\"id\":\"chatcmpl-stall\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"stalled output\"},\"finish_reason\":null}]}\n\n", 200)
@@ -687,15 +688,17 @@ func TestIncompleteNoticeAfterStall(t *testing.T) {
 	if !strings.Contains(s, "stalled output") {
 		t.Errorf("content missing: %s", s)
 	}
-	if !strings.Contains(s, "API Error: Response stalled mid-stream. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", s)
-	}
 	types := eventTypes(parseSSE(t, s))
-	if !contains(types, "message_delta") || !contains(types, "message_stop") {
-		t.Errorf("turn must complete gracefully: %v", types)
+	if !contains(types, "error") {
+		t.Fatalf("error event missing: %v\nbody = %s", types, s)
 	}
-	if contains(types, "error") {
-		t.Errorf("unexpected error event: %v", types)
+	parsed := eventData(parseSSE(t, s), "error")
+	errObj, _ := parsed["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "overloaded_error" {
+		t.Errorf("error.type = %v", errObj)
+	}
+	if contains(types, "message_delta") || contains(types, "message_stop") {
+		t.Errorf("no lifecycle events after error: %v", types)
 	}
 }
 
@@ -859,10 +862,10 @@ func TestDumpFinalizedOnMidStreamError(t *testing.T) {
 	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
-	if !strings.Contains(s, "Upstream stream ended without a finish_reason") {
+	if !strings.Contains(s, "Connection closed mid-response. The response above may be incomplete") {
 		t.Errorf("body = %s", s)
 	}
-	if !strings.Contains(s, `"type":"stream_error"`) {
+	if !strings.Contains(s, `"type":"overloaded_error"`) {
 		t.Errorf("body = %s", s)
 	}
 
@@ -878,6 +881,7 @@ func TestDumpFinalizedOnMidStreamError(t *testing.T) {
 func TestUpstreamAbortWithContentCategorized(t *testing.T) {
 	// Content, then a connection reset. The test client reads the response to
 	// completion — a genuine upstream abort, NOT client-initiated.
+	// With the fix, the hadContent path emits an error event (not a completed turn).
 	up := mockUpstreamAbort(t, "data: {\"id\":\"chatcmpl-caseB\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n")
 	cfg := testConfig(up.URL)
 	cfg.DumpDir = t.TempDir()
@@ -886,13 +890,13 @@ func TestUpstreamAbortWithContentCategorized(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 
-	// Proves the hadContent swallow path: notice appended, turn completed
-	// normally, no event:error.
-	if !strings.Contains(s, "API Error: Connection closed mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", s)
+	// Must contain the error event.
+	if !contains(eventTypes(parseSSE(t, s)), "error") {
+		t.Errorf("error event missing: %s", s)
 	}
-	if contains(eventTypes(parseSSE(t, s)), "error") {
-		t.Errorf("unexpected error event: %s", s)
+	// Must NOT contain message_delta or message_stop.
+	if contains(eventTypes(parseSSE(t, s)), "message_delta") || contains(eventTypes(parseSSE(t, s)), "message_stop") {
+		t.Errorf("no lifecycle events after error: %s", s)
 	}
 
 	// Root cause = upstream abort → upstream-aborted/ bucket.
@@ -913,10 +917,11 @@ func TestUpstreamAbortWithContentCategorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(downResp), "Reason: completed") {
+	// Downstream also shows upstream_abort (error event, not a completed turn).
+	if !strings.Contains(string(downResp), "Reason: upstream_abort") {
 		t.Errorf("downstream-response.log = %s", downResp)
 	}
-	if strings.Contains(string(downResp), "Reason: upstream_abort") {
+	if strings.Contains(string(downResp), "Reason: completed") {
 		t.Errorf("downstream-response.log = %s", downResp)
 	}
 }

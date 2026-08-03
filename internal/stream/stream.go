@@ -9,11 +9,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"iter"
 	"strings"
-	"time"
 
 	"github.com/chinfeng/chat-to-messages/internal/convert"
 	"github.com/chinfeng/chat-to-messages/internal/dump"
@@ -62,28 +60,6 @@ type Options struct {
 	// downstream-initiated; the route's cancel() path owns that label). When
 	// omitted, upstream-termination reporting is skipped entirely.
 	IsDownstreamAborted func() bool
-}
-
-// BuildIncompleteNotice builds the Claude-standard incomplete-notice text
-// appended when a streaming request fails mid-response AFTER the upstream has
-// started producing output. Mirrors the documented strings at
-// https://code.claude.com/docs/en/errors#the-response-above-may-be-incomplete.
-// When no output was produced yet this notice is NOT used — the error
-// surfaces from Err() instead.
-func BuildIncompleteNotice(err error) string {
-	var streamErr *UpstreamStreamError
-	if errors.As(err, &streamErr) {
-		return "\n\nAPI Error: Server error mid-response. The response above may be incomplete."
-	}
-	var abortedErr *UpstreamAbortedError
-	if errors.As(err, &abortedErr) {
-		if abortedErr.Subtype == "connection_closed" {
-			return "\n\nAPI Error: Connection closed mid-response. The response above may be incomplete."
-		}
-		return "\n\nAPI Error: Response stalled mid-stream. The response above may be incomplete."
-	}
-	// Fallback for unknown errors
-	return "\n\nAPI Error: Response stalled mid-stream. The response above may be incomplete."
 }
 
 // ExtractUsageInfo mirrors the TS extractUsageInfo(): Anthropic-compatible
@@ -239,7 +215,7 @@ func (s *Streamer) iterate(emit func(string), stop *bool) error {
 		// (equivalent to the TS iterUpstreamChunks throw).
 		if chunk.Err != nil {
 			return &UpstreamAbortedError{
-				Message: "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
+				Message: "Connection closed mid-response. The response above may be incomplete.",
 				Subtype: "connection_closed",
 			}
 		}
@@ -273,7 +249,7 @@ func (s *Streamer) iterate(emit func(string), stop *bool) error {
 			if msg == "" {
 				msg = fmt.Sprintf("upstream error %d", code)
 			}
-			return &UpstreamStreamError{Message: msg, Code: code}
+			return &UpstreamStreamError{Message: "Server error mid-response. The response above may be incomplete. (upstream: " + msg + ")", Code: code}
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -356,7 +332,7 @@ func (s *Streamer) iterate(emit func(string), stop *bool) error {
 			s.finishReason = "stop"
 		} else {
 			return &UpstreamAbortedError{
-				Message: "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
+				Message: "Response stalled mid-stream. The response above may be incomplete.",
 				Subtype: "response_stalled",
 			}
 		}
@@ -411,39 +387,11 @@ func (s *Streamer) handleError(emit func(string), loopErr error) {
 		return
 	}
 
-	// Append the Claude-standard incomplete notice as a text content block
-	// and complete the turn — the partial output + notice is preserved.
-	notice := BuildIncompleteNotice(loopErr)
-	s.ensureTextBlock(emit)
-	emit(s.builder.TextDelta(notice))
-	for _, ev := range s.builder.CloseContentBlocks() {
-		emit(ev)
-	}
-
-	completion := s.completionEstimate()
-	reason := s.finishReason
-	if reason == "" {
-		reason = "stop"
-	}
-	if s.opts == nil || !s.opts.SkipMessageLifecycle {
-		emit(s.builder.MessageDelta(sse.MapStopReason(reason), &completion, nil))
-		emit(s.builder.MessageStop())
-	}
-
-	// The upstream aborted, but the downstream turn completed gracefully.
-	// Record the TRUE upstream outcome to the dump — gated on the downstream
-	// NOT having initiated the disconnect.
-	checkDownstreamAborted := s.opts != nil && s.opts.IsDownstreamAborted != nil
-	if s.dump != nil && checkDownstreamAborted && !s.opts.IsDownstreamAborted() {
-		s.dump.RecordUpstreamTermination(dump.UpstreamAbort, time.Now().UTC().Format(time.RFC3339))
-	}
-
-	// The upstream failed, but the downstream turn completed gracefully —
-	// both error kinds are treated identically (TS catch block): the partial
-	// output plus notice is the complete story and the generator ends
-	// normally (Err() stays nil). Only the no-output path surfaces the error
-	// from Err(). User ruling 2026-08-03 (follow TS).
-	s.err = nil
+	// Content was already produced: surface the error so the route layer
+	// emits an `event: error` SSE event per the Anthropic Messages
+	// streaming protocol. No message_delta/message_stop follows
+	// the error event — the client SDK throws and discards the partial.
+	s.err = loopErr
 }
 
 // finalize is the normal post-loop flush (TS lines after the try/catch):
