@@ -53,14 +53,20 @@ func errorBody(errorType, message string) apiErrorBody {
 	return b
 }
 
-func invalidRequestError(message string) apiErrorBody { return errorBody("invalid_request_error", message) }
-func authenticationError(message string) apiErrorBody { return errorBody("authentication_error", message) }
-func notFoundError(message string) apiErrorBody       { return errorBody("not_found_error", message) }
-func serverError(message string) apiErrorBody         { return errorBody("api_error", message) }
+func invalidRequestError(message string) apiErrorBody {
+	return errorBody("invalid_request_error", message)
+}
+func authenticationError(message string) apiErrorBody {
+	return errorBody("authentication_error", message)
+}
+func notFoundError(message string) apiErrorBody { return errorBody("not_found_error", message) }
+func serverError(message string) apiErrorBody   { return errorBody("api_error", message) }
 
 // upstreamError prefixes the message with "Upstream error: " exactly like the
 // TS upstreamError() helper.
-func upstreamError(message string) apiErrorBody { return errorBody("api_error", "Upstream error: "+message) }
+func upstreamError(message string) apiErrorBody {
+	return errorBody("api_error", "Upstream error: "+message)
+}
 
 // writeJSON writes an Anthropic-format JSON response with the CORS header the
 // TS index.ts adds to every response. No trailing newline, no HTML escaping
@@ -211,16 +217,15 @@ func applyIncludeUsage(body map[string]any) {
 	}
 }
 
-// buildUpstreamRequest mirrors buildUpstreamRequest() in routes.ts: builds
-// the OpenAI-compatible request body (stream: true, model extra merged,
-// include_usage applied, canonicalized) and the /chat/completions URL.
-// Returns the wire body and the pretty-printed body for the dump.
-func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, apiKey string) (url string, wire []byte, pretty []byte, err error) {
+// buildBaseBody is the shared upstream body construction for both
+// buildUpstreamRequest and buildUpstreamRequestBodyOnly (port of the body
+// steps of buildUpstreamRequest() in routes.ts): base body, stream: true,
+// model extra merged, include_usage applied, canonicalized.
+func buildBaseBody(cfg *config.Config, requestData *convert.RequestData) (map[string]any, error) {
 	body, err := convert.BuildBaseRequestBody(requestData, 4096, convert.ReplayThinkTags)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, err
 	}
-	url = strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions"
 	body["stream"] = true
 
 	extra := config.ResolveModelExtra(requestData.Model, cfg.ModelOverrides)
@@ -228,7 +233,19 @@ func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, 
 		body = config.DeepMerge(body, extra)
 	}
 	applyIncludeUsage(body)
-	body = convert.PrepareCanonicalBody(body)
+	return convert.PrepareCanonicalBody(body), nil
+}
+
+// buildUpstreamRequest mirrors buildUpstreamRequest() in routes.ts: builds
+// the OpenAI-compatible request body (stream: true, model extra merged,
+// include_usage applied, canonicalized) and the /chat/completions URL.
+// Returns the wire body and the pretty-printed body for the dump.
+func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, apiKey string) (url string, wire []byte, pretty []byte, err error) {
+	body, err := buildBaseBody(cfg, requestData)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	url = strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions"
 
 	wire, err = json.Marshal(body)
 	if err != nil {
@@ -242,12 +259,20 @@ func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, 
 	return url, wire, pretty, nil
 }
 
-// handleServerToolRequest is a stub for the agentic-loop flow (Task 11).
-// Requests that contain server tools when server tools are enabled are
-// intercepted here; until Task 11 lands the stub returns 501.
-func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, apiKey string, inputTokens int64) {
-	session.Finish()
-	writeJSON(w, http.StatusNotImplemented, errorBody("api_error", "Server tool requests are not implemented yet."))
+// buildUpstreamRequestBodyOnly mirrors buildUpstreamRequestBodyOnly() in
+// routes.ts: the same body as buildUpstreamRequest (full body including the
+// server tool function schemas — Claude Code puts server tools in the tools
+// array), compact JSON for the wire.
+func buildUpstreamRequestBodyOnly(cfg *config.Config, requestData *convert.RequestData) (url string, wire []byte, err error) {
+	body, err := buildBaseBody(cfg, requestData)
+	if err != nil {
+		return "", nil, err
+	}
+	wire, err = json.Marshal(body)
+	if err != nil {
+		return "", nil, err
+	}
+	return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions", wire, nil
 }
 
 // handleMessages handles POST /v1/messages (port of handleMessages() in
@@ -428,7 +453,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 
 	evCh := make(chan string, 64) // pump goroutine → select loop
 	pumpDone := make(chan struct{})
-	go func() {                   // pump: consume streamer.Events()
+	go func() { // pump: consume streamer.Events()
 		defer close(pumpDone)
 		defer close(evCh)
 		for ev := range streamer.Events() {
