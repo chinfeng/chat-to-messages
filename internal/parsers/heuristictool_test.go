@@ -120,9 +120,11 @@ func TestHeuristicFunctionHeaderTooLong(t *testing.T) {
 		longPrefix += "x"
 	}
 	filtered, tools := p.Feed(longPrefix)
-	// 超过 100 字符仍未匹配 <function= → 逐字符转文本
-	if filtered == "" {
-		t.Error("should have drained to text")
+	// 超过 100 字符仍未匹配 <function= → 逐字符转文本。剥离按 rune 粒度：
+	// 首个字符是整个 "●"（3 字节 UTF-8），而非其首字节（修复前会输出
+	// 无效 UTF-8 字节 0xE2，故此处精确断言 filtered == "●"）。
+	if filtered != "●" {
+		t.Errorf("filtered = %q", filtered)
 	}
 	if len(tools) != 0 {
 		t.Errorf("tools = %d", len(tools))

@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // parserState is the state-machine state of HeuristicToolParser.
@@ -169,10 +170,14 @@ func (p *HeuristicToolParser) Feed(text string) (string, []map[string]any) {
 				p.currentParameters = map[string]string{}
 				p.buffer = p.buffer[m[1]:]
 				p.state = parserStateParsingParameters
-			} else if len(p.buffer) > 100 {
-				// Overlong header without <function= → drain one char to text.
-				filteredOutputParts = append(filteredOutputParts, p.buffer[:1])
-				p.buffer = p.buffer[1:]
+			} else if utf8.RuneCountInString(p.buffer) > 100 {
+				// Overlong header without <function= → drain one character to
+				// text. Character-granularity matches TS `length > 100` /
+				// `buffer[0]` + `slice(1)` (code units); byte-slicing would
+				// emit a partial UTF-8 rune (the buffer starts with ●).
+				_, size := utf8.DecodeRuneInString(p.buffer)
+				filteredOutputParts = append(filteredOutputParts, p.buffer[:size])
+				p.buffer = p.buffer[size:]
 				p.state = parserStateText
 			} else {
 				break
