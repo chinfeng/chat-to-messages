@@ -1,6 +1,9 @@
 package sse
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // MapStopReason maps an OpenAI finish_reason to the Anthropic stop_reason
 // vocabulary. Unknown or empty reasons fall back to "end_turn".
@@ -59,11 +62,20 @@ func BuildRetryableMidStreamErrorSse(message string) string {
 
 // FormatEvent renders one SSE event as `event: <type>\ndata: <json>\n\n`.
 // data may be any JSON-marshalable value; a marshal failure falls back to
-// `{}` rather than corrupting the stream.
+// `{}` rather than corrupting the stream. HTML escaping is disabled so the
+// bytes match TS JSON.stringify (which leaves `<`, `>`, `&` literal); clients
+// decode the JSON identically either way.
 func FormatEvent(eventType string, data any) string {
-	payload, err := json.Marshal(data)
-	if err != nil {
-		payload = []byte("{}")
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(data); err != nil {
+		buf.Reset()
+		buf.WriteString("{}")
+	} else {
+		// Encoder.Encode appends a trailing newline; strip it so the event
+		// keeps the TS `event: <type>\ndata: <json>\n\n` shape.
+		buf.Truncate(buf.Len() - 1)
 	}
-	return "event: " + eventType + "\ndata: " + string(payload) + "\n\n"
+	return "event: " + eventType + "\ndata: " + buf.String() + "\n\n"
 }

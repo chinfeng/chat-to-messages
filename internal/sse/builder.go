@@ -459,6 +459,56 @@ func (b *Builder) NextIndex() int {
 	return b.blocks.nextIndex
 }
 
+// AllocateIndex reserves and returns the next content block index,
+// advancing the counter (unlike NextIndex, which only peeks).
+func (b *Builder) AllocateIndex() int {
+	return b.blocks.allocateIndex()
+}
+
+// ThinkingIndex returns the current thinking block index, or -1 when no
+// thinking block is open.
+func (b *Builder) ThinkingIndex() int {
+	return b.blocks.thinkingIndex
+}
+
+// TextIndex returns the current text block index, or -1 when no text block
+// is open.
+func (b *Builder) TextIndex() int {
+	return b.blocks.textIndex
+}
+
+// ToolIndices returns the tool indices in tool start order.
+func (b *Builder) ToolIndices() []int {
+	out := make([]int, len(b.blocks.toolOrder))
+	copy(out, b.blocks.toolOrder)
+	return out
+}
+
+// ToolName returns the registered name for a tool index ("" when absent).
+func (b *Builder) ToolName(index int) string {
+	if state := b.blocks.toolStates[index]; state != nil {
+		return state.name
+	}
+	return ""
+}
+
+// ToolID returns the stream tool id for a tool index ("" when absent).
+func (b *Builder) ToolID(index int) string {
+	if state := b.blocks.toolStates[index]; state != nil {
+		return state.toolID
+	}
+	return ""
+}
+
+// ToolStarted reports whether the tool block for a tool index has been
+// started.
+func (b *Builder) ToolStarted(index int) bool {
+	if state := b.blocks.toolStates[index]; state != nil {
+		return state.started
+	}
+	return false
+}
+
 // SetNextIndex shifts the next content block index (used by the agentic
 // loop to continue a prior stream's index space).
 func (b *Builder) SetNextIndex(n int) {
