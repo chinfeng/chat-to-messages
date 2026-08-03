@@ -654,12 +654,19 @@ func (s *Streamer) processToolCall(emit func(string), tc openai.ToolCallDelta) {
 	}
 
 	if resolvedName == "Task" {
+		// Task tool args are routed through BufferTaskArgs so run_in_background
+		// is forced to false once the JSON parses. While the buffer is
+		// incomplete the raw fragments are HELD (not emitted): emitting them
+		// would leak run_in_background:true and, once the canonical JSON
+		// arrives, leave the client a corrupt duplicate concatenation. The
+		// finalize flush emits the repair result for buffers that never
+		// completed. (Code-review fix: option A — hold until complete.)
 		if argsJSON := s.builder.BufferTaskArgs(tcIndex, args); argsJSON != nil {
 			if canonical, err := convert.CanonicalJSONStringify(argsJSON); err == nil {
 				emit(s.builder.EmitToolDelta(tcIndex, canonical))
-				return
 			}
 		}
+		return
 	}
 	emit(s.builder.EmitToolDelta(tcIndex, args))
 }

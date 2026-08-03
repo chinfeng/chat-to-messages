@@ -477,13 +477,48 @@ func TestInferToolNameByIndex(t *testing.T) {
 }
 
 func TestStreamTaskRunInBackgroundForced(t *testing.T) {
-	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Task\",\"arguments\":\"{\\\"run_in_background\\\":true,\\\"description\\\":\\\"d\\\"}\"}}]}}]}\n\n" +
+	// 多分片 Task 原生工具调用（评审修复 Important + 裁决意图）：参数跨 3 个
+	// chunk 到达。缓冲未完成时原始分片被暂扣（不发，避免泄漏 run_in_background:true
+	// 与重复/损坏拼接）；凑齐后只发一次 canonical 完整 JSON。断言：
+	//  1) 输出不出现 "run_in_background":true
+	//  2) 客户端累积的 partial_json 拼接是合法 JSON
+	//  3) 累积值 run_in_background=false、description="d"
+	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Task\",\"arguments\":\"{\\\"run_in_background\\\":true,\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"description\\\":\\\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"d\\\"}\"}}]}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 		"data: [DONE]\n\n"
 	ev := allEvents(t, body, req(t, "m1"))
 	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, `"partial_json"`) {
-		t.Errorf("task delta: %s", joined)
+	if strings.Contains(joined, `"run_in_background":true`) {
+		t.Errorf("run_in_background must never appear as true: %s", joined)
+	}
+	// 客户端累积的 partial_json 拼接必须为合法 JSON 且 run_in_background=false
+	var acc strings.Builder
+	for _, e := range ev {
+		for _, line := range strings.Split(e, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var d map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &d); err != nil {
+				continue
+			}
+			delta, _ := d["delta"].(map[string]any)
+			if pj, ok := delta["partial_json"].(string); ok {
+				acc.WriteString(pj)
+			}
+		}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(acc.String()), &parsed); err != nil {
+		t.Fatalf("accumulated partial_json must be valid JSON: %q: %v", acc.String(), err)
+	}
+	if parsed["run_in_background"] != false {
+		t.Errorf("run_in_background = %v, want false (accumulated: %q)", parsed["run_in_background"], acc.String())
+	}
+	if parsed["description"] != "d" {
+		t.Errorf("description = %v, want d (accumulated: %q)", parsed["description"], acc.String())
 	}
 }
 
