@@ -18,8 +18,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"chat-to-messages/internal/config"
-	"chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/dump"
 )
 
 // maxResponseBodyLog mirrors MAX_RESPONSE_BODY_LOG in server_tools.ts.

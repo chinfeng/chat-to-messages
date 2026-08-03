@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"chat-to-messages/internal/convert"
-	"chat-to-messages/internal/dump"
-	"chat-to-messages/internal/openai"
-	"chat-to-messages/internal/parsers"
-	"chat-to-messages/internal/sse"
+	"github.com/chinfeng/chat-to-messages/internal/convert"
+	"github.com/chinfeng/chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/openai"
+	"github.com/chinfeng/chat-to-messages/internal/parsers"
+	"github.com/chinfeng/chat-to-messages/internal/sse"
 )
 
 // UpstreamStreamError mirrors the TS class of the same name: the upstream

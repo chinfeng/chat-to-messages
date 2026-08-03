@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"chat-to-messages/internal/convert"
-	"chat-to-messages/internal/openai"
+	"github.com/chinfeng/chat-to-messages/internal/convert"
+	"github.com/chinfeng/chat-to-messages/internal/openai"
 )
 
 // ---- helpers (task-9 brief) ----

@@ -26,13 +26,13 @@ import (
 	"sync"
 	"time"
 
-	"chat-to-messages/internal/config"
-	"chat-to-messages/internal/convert"
-	"chat-to-messages/internal/dump"
-	"chat-to-messages/internal/openai"
-	"chat-to-messages/internal/servertool"
-	"chat-to-messages/internal/sse"
-	"chat-to-messages/internal/stream"
+	"github.com/chinfeng/chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/convert"
+	"github.com/chinfeng/chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/openai"
+	"github.com/chinfeng/chat-to-messages/internal/servertool"
+	"github.com/chinfeng/chat-to-messages/internal/sse"
+	"github.com/chinfeng/chat-to-messages/internal/stream"
 )
 
 // maxIterations bounds the agentic loop (MAX_ITERATIONS in routes.ts).

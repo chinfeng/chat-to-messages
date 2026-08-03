@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/config"
 )
 
 // mockUpstream returns an upstream server that writes body verbatim with the

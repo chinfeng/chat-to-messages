@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"chat-to-messages/internal/config"
-	"chat-to-messages/internal/openai"
+	"github.com/chinfeng/chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/openai"
 )
 
 func TestAgenticLoopToolThenText(t *testing.T) {

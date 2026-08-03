@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"chat-to-messages/internal/anthropic"
+	"github.com/chinfeng/chat-to-messages/internal/anthropic"
 )
 
 func decodeMessage(t *testing.T, data string) anthropic.Message {

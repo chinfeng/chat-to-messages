@@ -8,8 +8,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"chat-to-messages/internal/anthropic"
-	"chat-to-messages/internal/servertool"
+	"github.com/chinfeng/chat-to-messages/internal/anthropic"
+	"github.com/chinfeng/chat-to-messages/internal/servertool"
 )
 
 // OpenAIConversionError mirrors the TS error class of the same name.

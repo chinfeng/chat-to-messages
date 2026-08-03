@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"chat-to-messages/internal/config"
-	"chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/dump"
 )
 
 func testCfg() config.ServerToolConfig {
