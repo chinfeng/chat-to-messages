@@ -311,6 +311,15 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		writeJSON(w, http.StatusBadRequest, invalidRequestError("Invalid JSON in request body."))
 		return
 	}
+	// Reject trailing garbage after the JSON object (`{...}garbage`), matching
+	// TS JSON.parse: a well-formed single object decodes with a second decode
+	// landing on EOF, anything else is a 400.
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		session.Finish()
+		writeJSON(w, http.StatusBadRequest, invalidRequestError("Invalid JSON in request body."))
+		return
+	}
 
 	// Log the downstream request. TS pretty-prints the body (2-space indent);
 	// the raw client bytes are stored verbatim here (plan decision — same

@@ -332,6 +332,11 @@ func TestInvalidJSONAndModel(t *testing.T) {
 	if resp := postMessages(t, h, `not-json`, nil); resp.StatusCode != 400 {
 		t.Errorf("bad json: %d", resp.StatusCode)
 	}
+	// Trailing garbage after a well-formed object (`{...}garbage`) must be
+	// rejected like TS JSON.parse, not silently accepted.
+	if resp := postMessages(t, h, `{"model":"m","messages":[]}garbage`, nil); resp.StatusCode != 400 {
+		t.Errorf("trailing garbage: %d", resp.StatusCode)
+	}
 	if resp := postMessages(t, h, `{"messages":[]}`, nil); resp.StatusCode != 400 {
 		t.Errorf("no model: %d", resp.StatusCode)
 	}
