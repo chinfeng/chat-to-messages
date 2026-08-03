@@ -61,7 +61,9 @@ func TestTerminationBuckets(t *testing.T) {
 		{"upstream_abort", &Termination{Reason: UpstreamAbort}, "upstream-aborted"},
 		{"timeout", &Termination{Reason: UpstreamTimeout}, "failed"},
 		{"upstream_error", &Termination{Reason: UpstreamError}, "failed"},
-		{"none", nil, "completed"},
+		// 裁决（用户 2026-08-03，跟随 TS）：未记录任何终止时 pick 返回零值
+		// （对应 TS undefined），getTargetSubdir 缺省分支 → "failed"。
+		{"none", nil, "failed"},
 	}
 	for _, c := range cases {
 		dir := t.TempDir()
@@ -115,15 +117,19 @@ func TestServerToolLog(t *testing.T) {
 	rc := 10
 	s.LogServerTool(ServerToolLogEntry{Tool: "web_search", Timestamp: "t", Input: "q", Engine: "brave", ResultCount: &rc})
 	s.Finish()
-	entries, _ := os.ReadDir(filepath.Join(dir, "completed"))
+	// 裁决（用户 2026-08-03，跟随 TS）：本会话未记录任何终止 → pick 返回零值
+	// → getTargetSubdir 缺省 → "failed" 桶。
+	entries, _ := os.ReadDir(filepath.Join(dir, "failed"))
 	if len(entries) != 1 {
 		t.Fatal("no completed entry")
 	}
-	b, err := os.ReadFile(filepath.Join(filepath.Join(dir, "completed", entries[0].Name()), "server-tools.log"))
+	b, err := os.ReadFile(filepath.Join(filepath.Join(dir, "failed", entries[0].Name()), "server-tools.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), "[Tool]") || !strings.Contains(string(b), "Result Count: 10") {
+	// 裁决（用户 2026-08-03，跟随 TS）：Result Count 节为
+	// "[Result Count]\n<数字>\n\n"，非 "Result Count: 10" 行式格式。
+	if !strings.Contains(string(b), "[Tool]") || !strings.Contains(string(b), "[Result Count]\n10") {
 		t.Errorf("server-tools.log: %s", b)
 	}
 }

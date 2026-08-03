@@ -202,11 +202,9 @@ func (s *Session) Finish() {
 //
 // Precedence: a downstream-initiated client disconnect beats everything;
 // then the upstream's own recorded outcome; then the tracked downstream
-// outcome. Deviation from TS: TS returns undefined when nothing was recorded
-// and buckets such a session under "failed" (getTargetSubdir default); the
-// brief test TestTerminationBuckets ("none" case) requires an unrecorded
-// session to land in "completed", so Go treats absence of information as a
-// normal completion.
+// outcome. When nothing was recorded at all, the zero value is returned
+// (TS undefined) and getTargetSubdir's default branch lands the session in
+// "failed" — verbatim TS behavior.
 func pickTerminationReason(tracked TerminationReason, upstream *Termination) TerminationReason {
 	if tracked == ClientAbort {
 		return ClientAbort
@@ -214,10 +212,7 @@ func pickTerminationReason(tracked TerminationReason, upstream *Termination) Ter
 	if upstream != nil {
 		return upstream.Reason
 	}
-	if tracked != "" {
-		return tracked
-	}
-	return Completed
+	return tracked
 }
 
 func getTargetSubdir(reason TerminationReason) string {
@@ -323,9 +318,7 @@ func formatServerToolEntry(e ServerToolLogEntry) string {
 		out += formatSection("Response Body", e.ResponseBody)
 	}
 	if e.ResultCount != nil {
-		// Deviation from TS ([Result Count]\n10\n\n): the brief test
-		// TestServerToolLog requires the substring "Result Count: 10".
-		out += formatSection("Result Count", "Result Count: "+strconv.Itoa(*e.ResultCount))
+		out += formatSection("Result Count", strconv.Itoa(*e.ResultCount))
 	}
 	if e.Skipped {
 		out += formatSection("Skipped", "true")
