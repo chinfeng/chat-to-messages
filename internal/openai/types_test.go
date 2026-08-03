@@ -1,0 +1,118 @@
+package openai
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+)
+
+func TestIterSSEChunksBasic(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: [DONE]\n\n"
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), strings.NewReader(body), nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("chunks = %d", len(chunks))
+	}
+	if *chunks[0].Choices[0].Delta.Content != "hi" {
+		t.Errorf("c0 = %+v", chunks[0])
+	}
+	if !chunks[2].Done {
+		t.Error("last should be [DONE] sentinel")
+	}
+}
+
+func TestIterSSEChunksCRLFAndIgnoreNonData(t *testing.T) {
+	body := ": keepalive comment\r\nevent: ping\r\ndata: {\"usage\":{\"prompt_tokens\":5}}\r\n\r\ndata: not-json\r\n\r\ndata: [DONE]\r\n\r\n"
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), strings.NewReader(body), nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d: %+v", len(chunks), chunks)
+	}
+	if chunks[0].Usage == nil || chunks[0].Usage.PromptTokens != 5 {
+		t.Errorf("usage = %+v", chunks[0].Usage)
+	}
+}
+
+func TestIterSSEChunksSplitAcrossReads(t *testing.T) {
+	// 分片读：data 行跨多个 Read
+	reader := io.MultiReader(
+		strings.NewReader("data: {\"choice"),
+		strings.NewReader("s\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"),
+		strings.NewReader("data: [DONE]\n\n"),
+	)
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), reader, nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 2 || chunks[0].Choices == nil {
+		t.Fatalf("chunks = %d: %+v", len(chunks), chunks)
+	}
+}
+
+func TestIterSSEChunksRawCapture(t *testing.T) {
+	var raw strings.Builder
+	body := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	for range IterSSEChunks(t.Context(), strings.NewReader(body), &raw) {
+	}
+	if raw.String() != body {
+		t.Errorf("raw = %q", raw.String())
+	}
+}
+
+type errReader struct{ n int }
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.n > 0 {
+		r.n--
+		return copy(p, "data: {\"choices\":[]}\n\n"), nil
+	}
+	return 0, errors.New("connection reset")
+}
+
+func TestIterSSEChunksReadError(t *testing.T) {
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), &errReader{n: 1}, nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d", len(chunks))
+	}
+	if chunks[1].Err == nil {
+		t.Error("expected Err on last chunk")
+	}
+	if !strings.Contains(chunks[1].Err.Error(), "connection reset") {
+		t.Errorf("err = %v", chunks[1].Err)
+	}
+}
+
+func TestChunkErrorObject(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"error":{"message":"rate limited","code":429}}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Error == nil || c.Error.Message != "rate limited" || *c.Error.Code != 429 {
+		t.Errorf("err obj = %+v", c.Error)
+	}
+}
+
+func TestChunkToolCallDelta(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":"}}],"finish_reason":null}}]}`); err != nil {
+		t.Fatal(err)
+	}
+	tc := c.Choices[0].Delta.ToolCalls[0]
+	if tc.Index != 0 || *tc.ID != "call_1" || *tc.Function.Name != "f" || *tc.Function.Arguments != `{"a":` {
+		t.Errorf("tc = %+v", tc)
+	}
+}
+
+func decodeChunk(c *Chunk, data string) error {
+	dec := json.NewDecoder(strings.NewReader(data))
+	return dec.Decode(c)
+}
