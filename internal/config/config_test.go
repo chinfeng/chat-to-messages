@@ -158,13 +158,13 @@ func TestLoadPortRangeValidation(t *testing.T) {
 		args []string
 		want int
 	}{
-		{args: []string{"--port", "0"}, want: 8082},          // parseInt fallback / invalid low
-		{args: []string{"--port", "-1"}, want: 8082},         // negative
-		{args: []string{"--port", "65536"}, want: 8082},      // above the range
+		{args: []string{"--port", "0"}, want: 8082},            // parseInt fallback / invalid low
+		{args: []string{"--port", "-1"}, want: 8082},           // negative
+		{args: []string{"--port", "65536"}, want: 8082},        // above the range
 		{args: []string{"--port", "not-a-number"}, want: 8082}, // unparsable → 0 → fallback
-		{args: []string{"--port", "1"}, want: 1},             // in-range boundary kept
-		{args: []string{"--port", "65535"}, want: 65535},     // in-range boundary kept
-		{args: nil, want: 8082},                              // default
+		{args: []string{"--port", "1"}, want: 1},               // in-range boundary kept
+		{args: []string{"--port", "65535"}, want: 65535},       // in-range boundary kept
+		{args: nil, want: 8082},                                // default
 	} {
 		if got := Load(tt.args).Port; got != tt.want {
 			t.Errorf("Load(%v).Port = %d, want %d", tt.args, got, tt.want)
@@ -173,7 +173,8 @@ func TestLoadPortRangeValidation(t *testing.T) {
 }
 
 // Ported from tests/config.test.ts "reads server tool CLI arguments".
-func TestLoadServerToolArguments(t *testing.T) {	cfg := Load([]string{
+func TestLoadServerToolArguments(t *testing.T) {
+	cfg := Load([]string{
 		"--enable-web-search",
 		"--enable-web-fetch",
 		"--web-search-api-key", "BST-xxx",
