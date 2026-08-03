@@ -277,7 +277,18 @@ When `--auth-token` is set, client requests must include a matching `x-api-key` 
 
 ### Request Dumping
 
-Enable `--dump <dir>` to log each downstream request into a sequentially numbered directory containing `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log`. On completion, the directory is renamed to `{seq}-{startTime}-{endTime}` for chronological sorting. Full SSE event streams are also captured.
+Enable `--dump <dir>` to record each downstream request. A session is written to `<dir>/in-progress/<id>/` (where `<id>` is a UUID) and, on completion, renamed into a classification bucket that reflects the **root cause** of the termination:
+
+| Bucket | Meaning |
+|--------|---------|
+| `completed` | Normal completion (upstream delivered a proper finish) |
+| `client-aborted` | Client disconnected mid-request |
+| `upstream-aborted` | Upstream connection dropped / aborted without a proper finish |
+| `failed` | Upstream timeout, upstream error status or empty body, or unknown termination |
+
+The final directory name is `<id>__START_<startTime>__END_<endTime>`, preserving chronology within each bucket. A client-initiated disconnect takes precedence over everything; otherwise the upstream's own recorded outcome wins over the downstream outcome.
+
+Each session contains `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log` — the streaming bodies capture the full SSE event streams. When proxy-side server tools (web_search / web_fetch / agentic loop) were invoked, a `server-tools.log` with one entry per call is written as well.
 
 ```bash
 ./chat-to-messages \
@@ -290,11 +301,18 @@ Example dump directory structure:
 
 ```
 /var/log/chat-to-messages/
-└── 1-2026-05-20T08-30-00-000Z-2026-05-20T08-30-05-123Z/
-    ├── downstream-request.log
-    ├── downstream-response.log
-    ├── upstream-request.log
-    └── upstream-response.log
+├── in-progress/
+│   └── 3f1a2b4c-8d9e-4f5a-b6c7-8d9e0f1a2b3c/
+├── completed/
+│   └── 3f1a2b4c-8d9e-4f5a-b6c7-8d9e0f1a2b3c__START_2026-05-20T08-30-00-000Z__END_2026-05-20T08-30-05-123Z/
+│       ├── downstream-request.log
+│       ├── downstream-response.log
+│       ├── upstream-request.log
+│       ├── upstream-response.log
+│       └── server-tools.log
+├── client-aborted/
+├── upstream-aborted/
+└── failed/
 ```
 
 ## Cross-Compilation
