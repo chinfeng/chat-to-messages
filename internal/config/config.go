@@ -152,11 +152,20 @@ func Load(args []string) *Config {
 		WebFetchMaxContentTokens: parseInt(getArg("web-fetch-max-content-tokens", "5000")),
 	}
 
+	// Port: parseInt yields 0 for unparsable/absent values; a value outside
+	// the valid port range (1-65535) cannot be bound — warn and fall back to
+	// the default 8082 rather than failing the server later at listen time.
+	port := parseInt(getArg("port", "8082"))
+	if port <= 0 || port > 65535 {
+		warn("Invalid --port %d (must be between 1 and 65535); falling back to 8082", port)
+		port = 8082
+	}
+
 	return &Config{
 		UpstreamBaseURL: getArg("upstream-base-url", "https://api.openai.com/v1"),
 		UpstreamAPIKey:  getArg("upstream-api-key", ""),
 		AuthToken:       getArg("auth-token", ""),
-		Port:            parseInt(getArg("port", "8082")),
+		Port:            port,
 		EnableThinking:  getBool("enable-thinking", true),
 		DumpDir:         getArg("dump", ""),
 		ModelOverrides:  modelOverrides,
