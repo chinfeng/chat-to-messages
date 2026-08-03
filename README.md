@@ -286,7 +286,7 @@ Enable `--dump <dir>` to record each downstream request. A session is written to
 | `upstream-aborted` | Upstream connection dropped / aborted without a proper finish |
 | `failed` | Upstream timeout, upstream error status or empty body, or unknown termination |
 
-The final directory name is `<id>__START_<startTime>__END_<endTime>`, preserving chronology within each bucket. A client-initiated disconnect takes precedence over everything; otherwise the upstream's own recorded outcome wins over the downstream outcome.
+The final directory name is `<id>__START_<startTime>__END_<endTime>`. Since `<id>` is a UUID the names are not time-ordered on their own, but the `__START_` timestamp in the name restores the chronological sequence within each bucket. A client-initiated disconnect takes precedence over everything; otherwise the upstream's own recorded outcome wins over the downstream outcome.
 
 Each session contains `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log` — the streaming bodies capture the full SSE event streams. When proxy-side server tools (web_search / web_fetch / agentic loop) were invoked, a `server-tools.log` with one entry per call is written as well.
 

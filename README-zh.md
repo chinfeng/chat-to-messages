@@ -286,7 +286,7 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 | `upstream-aborted` | 上游连接中断 / 未正常 finish 即中止 |
 | `failed` | 上游超时、上游错误状态或空响应、未知终止 |
 
-最终目录名为 `<id>__START_<开始时间>__END_<结束时间>`，在各桶内保持时间序。客户端主动断开优先于一切；其次以上游自身的终止记录为准；最后才是下游侧记录的结果。
+最终目录名为 `<id>__START_<开始时间>__END_<结束时间>`。由于 `<id>` 是 UUID，目录名本身不保证时间顺序，但可按目录名中的 `__START_` 时间戳恢复各桶内的时序。客户端主动断开优先于一切；其次以上游自身的终止记录为准；最后才是下游侧记录的结果。
 
 每个会话包含 `downstream-request.log`、`downstream-response.log`、`upstream-request.log` 和 `upstream-response.log` — 流式响应体即为完整 SSE 事件流。若调用了代理端 server tools（web_search / web_fetch / agentic loop），还会额外写入按调用逐条记录的 `server-tools.log`。
 
