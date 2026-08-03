@@ -346,7 +346,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	}
 	inputTokens := convert.EstimateInputTokens(req.Messages)
 
-	// --- Server tool agentic loop (Task 11; stub returns 501 for now) ---
+	// --- Server tool agentic loop: requests containing server tool types are
+	// intercepted and handled by the agentic loop in agentic.go (web_search /
+	// web_fetch executed proxy-side, results injected, final text streamed). ---
 	if (cfg.ServerTools.WebSearch || cfg.ServerTools.WebFetch) && hasServerToolRequest(&req) {
 		handleServerToolRequest(w, r, cfg, session, requestStart, requestData, apiKey, inputTokens)
 		return

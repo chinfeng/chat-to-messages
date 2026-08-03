@@ -105,6 +105,55 @@ func TestAgenticLoopToolThenText(t *testing.T) {
 	}
 }
 
+// TestAgenticLoopSearchResultWithoutSnippet covers the two-line rendering when
+// a search result has no snippet/description: the downstream text must be
+// `[Web Search Results]\n<title>\n<url>` — never a literal "<nil>".
+func TestAgenticLoopSearchResultWithoutSnippet(t *testing.T) {
+	var calls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.URL.Path == "/search" {
+			// searxng 结果无 description 字段 → 无 snippet
+			io.WriteString(w, `{"results":[{"title":"No snippet title","url":"https://example.com/page"}]}`)
+			return
+		}
+		if calls.Add(1) == 1 {
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"q\\\"}\"}}]}}]}\n\n"+
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}}]}\n\n"+
+				"data: [DONE]\n\n")
+			return
+		}
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}}]}\n\n"+
+			"data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	cfg := testConfig(up.URL)
+	cfg.ServerTools = config.ServerToolConfig{WebSearch: true, WebSearchEngine: "searxng", WebSearchBaseURL: up.URL}
+	h := NewHandler(cfg)
+	body := `{"model":"m","messages":[{"role":"user","content":"x"}],"server_tools":[{"type":"web_search_20250305","name":"web_search"}]}`
+	resp := postMessages(t, h, body, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	joined := string(raw)
+	// 两行格式：标题\nURL（TS：snippet 缺失时不输出第三行）。SSE 的 data 载荷
+	// 把换行转义为字面 \n（反斜杠 n），断言用原始流中的转义形式。
+	if !strings.Contains(joined, "[Web Search Results]\\nNo snippet title\\nhttps://example.com/page\"") {
+		t.Errorf("two-line search result missing: %s", joined)
+	}
+	if strings.Contains(joined, "https://example.com/page\\n") {
+		t.Errorf("three-line search result rendered with trailing newline: %s", joined)
+	}
+	if strings.Contains(joined, "<nil>") {
+		t.Errorf("literal <nil> leaked into downstream: %s", joined)
+	}
+	if !strings.Contains(joined, "done") {
+		t.Errorf("final text missing: %s", joined)
+	}
+}
+
 func TestAgenticLoopMaxIterations(t *testing.T) {
 	var calls atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

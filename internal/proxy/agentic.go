@@ -469,6 +469,11 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 					} else if tc.name == "web_fetch" {
 						status := ""
 						for _, b := range contentBlocks {
+							// TS: b.type === "text" && typeof b.text === "string"
+							// && b.text.startsWith("Status: 4").
+							if b["type"] != "text" {
+								continue
+							}
 							if s, ok := b["text"].(string); ok && strings.HasPrefix(s, "Status: 4") {
 								status = "error"
 								break
@@ -532,6 +537,11 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 				} else if tc.Type == "web_fetch" {
 					status := ""
 					for _, b := range contentBlocks {
+						// TS: b.type === "text" && typeof b.text === "string"
+						// && b.text.startsWith("Status: 4").
+						if b["type"] != "text" {
+							continue
+						}
 						if s, ok := b["text"].(string); ok && strings.HasPrefix(s, "Status: 4") {
 							status = "error"
 							break
@@ -632,8 +642,9 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 		emitMu.Unlock()
 	}
 
-	// Ping heartbeat (TS pingInterval) interleaved with the stream; stopped
-	// and joined before the handler returns so the chunk log is race-free.
+	// Ping heartbeat (TS pingInterval) interleaved with the stream. The
+	// heartbeat goroutine appends to downstreamChunks under emitMu; stopPing
+	// halts it and joins before any dump join, so the chunk log is race-free.
 	pingDone := make(chan struct{})
 	var pingWG sync.WaitGroup
 	pingWG.Add(1)
@@ -650,8 +661,16 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 			}
 		}
 	}()
-	defer pingWG.Wait()
-	defer close(pingDone)
+	var pingStopped bool
+	stopPing := func() {
+		if pingStopped {
+			return
+		}
+		pingStopped = true
+		close(pingDone)
+		pingWG.Wait()
+	}
+	defer stopPing()
 
 	builder := sse.NewBuilder("msg_"+uuidV4(), requestData.Model, inputTokens, nil)
 
@@ -672,9 +691,21 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 			var searchResults []string
 			for _, b := range ev.content {
 				if b["type"] == "web_search_result" {
-					url := tsString(b["url"])
-					title := tsString(b["title"])
-					snippet := tsString(b["snippet"])
+					// TS: `b.url ? String(b.url) : ""` etc. — a missing/empty
+					// field must render as the two-line form, never a literal
+					// "<nil>" (tsString's fmt.Sprint(nil) would do that).
+					url := ""
+					if s, ok := b["url"].(string); ok {
+						url = s
+					}
+					title := ""
+					if s, ok := b["title"].(string); ok {
+						title = s
+					}
+					snippet := ""
+					if s, ok := b["snippet"].(string); ok && s != "" {
+						snippet = s
+					}
 					if snippet != "" {
 						searchResults = append(searchResults, title+"\n"+url+"\n"+snippet)
 					} else {
@@ -755,6 +786,7 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 			}
 			emit(line)
 		}
+		stopPing()
 		session.WriteDownstreamResponse(downstreamHeaders, http.StatusOK, strings.Join(downstreamChunks, ""),
 			&dump.Termination{Reason: dump.UpstreamAbort, DisconnectTime: nowISO()})
 		session.Finish()
@@ -774,7 +806,8 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 	emit(builder.MessageDelta("end_turn", &completion, nil))
 	emit(builder.MessageStop())
 
-	// 5. Finalize dump
+	// 5. Finalize dump (ping halted first so downstreamChunks is stable).
+	stopPing()
 	session.WriteUpstreamResponse(headerMap(finalRes.Header), finalRes.StatusCode, rawFinal.String(),
 		&dump.Termination{Reason: dump.Completed})
 	session.WriteDownstreamResponse(downstreamHeaders, http.StatusOK, strings.Join(downstreamChunks, ""),
