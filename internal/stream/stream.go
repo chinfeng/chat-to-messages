@@ -22,11 +22,11 @@ import (
 	"chat-to-messages/internal/sse"
 )
 
-// UpstreamStreamError mirrors the TS class of the same name: thrown when the
-// upstream embeds an error object in the SSE stream (HTTP 200 with an error
-// payload). Unlike UpstreamAbortedError it is never swallowed: the explicit
-// upstream failure surfaces from Err() even when the turn was completed
-// gracefully with an incomplete notice.
+// UpstreamStreamError mirrors the TS class of the same name: the upstream
+// embedded an error object in the SSE stream (HTTP 200 with an error payload).
+// Like the TS catch block, it is swallowed once output has been produced (the
+// partial turn plus incomplete notice completes gracefully and Err() stays
+// nil); with no output it propagates from Err().
 type UpstreamStreamError struct {
 	Message string
 	Code    int64
@@ -160,7 +160,6 @@ type Streamer struct {
 	finishReason    string
 	seenDone        bool
 	usageInfo       *openai.Usage // latest raw usage chunk
-	mergedUsage     *sse.UsageInfo
 	err             error
 }
 
@@ -252,7 +251,14 @@ func (s *Streamer) iterate(emit func(string), stop *bool) error {
 		}
 		if chunk.Usage != nil {
 			s.usageInfo = chunk.Usage
-			s.mergeUsage(chunk.Usage)
+			// TS spread semantics (`{...first, ...extract(chunk.usage)}`):
+			// extractUsageInfo always returns all four buckets (0 for absent
+			// fields), so the fresh extraction replaces the previous usage
+			// wholesale — a later bare usage chunk wipes earlier cache
+			// buckets. User ruling 2026-08-03 (follow TS).
+			if u := ExtractUsageInfo(chunk.Usage); u != nil {
+				s.builder.SetUsage(*u)
+			}
 		}
 		// Detect upstream error objects embedded in the SSE stream.
 		if chunk.Error != nil {
@@ -429,16 +435,12 @@ func (s *Streamer) handleError(emit func(string), loopErr error) {
 		s.dump.RecordUpstreamTermination(dump.UpstreamAbort, time.Now().UTC().Format(time.RFC3339))
 	}
 
-	// An explicit upstream error object is a definitive failure — surface it
-	// even though the turn was completed gracefully (task-9 golden vector).
-	// Connection aborts are jitter worth swallowing: the partial turn plus
-	// notice is the complete story.
-	var streamErr *UpstreamStreamError
-	if errors.As(loopErr, &streamErr) {
-		s.err = loopErr
-	} else {
-		s.err = nil
-	}
+	// The upstream failed, but the downstream turn completed gracefully —
+	// both error kinds are treated identically (TS catch block): the partial
+	// output plus notice is the complete story and the generator ends
+	// normally (Err() stays nil). Only the no-output path surfaces the error
+	// from Err(). User ruling 2026-08-03 (follow TS).
+	s.err = nil
 }
 
 // finalize is the normal post-loop flush (TS lines after the try/catch):
@@ -552,17 +554,14 @@ func (s *Streamer) finalize(emit func(string)) {
 	}
 }
 
-// ensureTextBlock is the thinking→text switch used by the stream. Unlike
-// Builder.EnsureTextBlock (which follows TS exactly and stops an open thinking
-// block WITHOUT a signature), the stream closes an open thinking block WITH
-// its signature_delta first — every thinking block stop in the emitted stream
-// carries the signature (task-9 golden vector TestStreamReasoningContent).
+// ensureTextBlock emits the thinking→text switch, following TS exactly
+// (Builder.EnsureTextBlock): an open thinking block is stopped WITHOUT a
+// signature_delta — the signature only appears when content blocks close with
+// thinking still open (CloseContentBlocks / CloseAllBlocks). Verified against
+// the TS reference: even a pure-thinking finalize emits no signature (the " "
+// placeholder-text branch closes the thinking block unsigned). User ruling
+// 2026-08-03 (third confirmation, follow TS): no signature on the switch.
 func (s *Streamer) ensureTextBlock(emit func(string)) {
-	if s.builder.SetThinkingStarted() {
-		for _, ev := range s.builder.CloseThinkingWithSignature() {
-			emit(ev)
-		}
-	}
 	for _, ev := range s.builder.EnsureTextBlock() {
 		emit(ev)
 	}
@@ -663,35 +662,6 @@ func (s *Streamer) processToolCall(emit func(string), tc openai.ToolCallDelta) {
 		}
 	}
 	emit(s.builder.EmitToolDelta(tcIndex, args))
-}
-
-// mergeUsage merges a fresh usage extraction into the builder, per-field
-// "fresher non-zero wins". ExtractUsageInfo always returns all four buckets
-// (0 when absent); a later bare usage chunk (e.g. only prompt/completion)
-// must not wipe cache buckets reported by an earlier richer chunk.
-func (s *Streamer) mergeUsage(chunkUsage *openai.Usage) {
-	u := ExtractUsageInfo(chunkUsage)
-	if u == nil {
-		return
-	}
-	var merged sse.UsageInfo
-	if s.mergedUsage != nil {
-		merged = *s.mergedUsage
-	}
-	if u.PromptTokens > 0 {
-		merged.PromptTokens = u.PromptTokens
-	}
-	if u.CompletionTokens > 0 {
-		merged.CompletionTokens = u.CompletionTokens
-	}
-	if u.CacheReadInputTokens > 0 {
-		merged.CacheReadInputTokens = u.CacheReadInputTokens
-	}
-	if u.CacheCreationInputTokens > 0 {
-		merged.CacheCreationInputTokens = u.CacheCreationInputTokens
-	}
-	s.mergedUsage = &merged
-	s.builder.SetUsage(merged)
 }
 
 // completionEstimate prefers the upstream completion_tokens count; falls back

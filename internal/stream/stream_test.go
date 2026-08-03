@@ -101,12 +101,16 @@ func TestStreamMessageLifecycle(t *testing.T) {
 }
 
 func TestStreamReasoningContent(t *testing.T) {
+	// 用户裁决 2026-08-03（第三次确认跟随 TS）：thinking→text 切换经
+	// ensure_text_block 直接 stop_thinking_block，不发 signature_delta；
+	// 签名只在内容块收尾、thinking 仍打开时出现。brief 原断言（切换前
+	// 必有签名）与 TS 不符，按裁决改为负向断言。
 	body := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think step 1\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
 	ev := allEvents(t, body, req(t, "m1"))
 	types := eventTypes(ev)
-	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"}
+	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("types = %v\n%v", types, ev)
 	}
@@ -114,13 +118,35 @@ func TestStreamReasoningContent(t *testing.T) {
 	if !strings.Contains(joined, `"delta":{"type":"thinking_delta","thinking":"think step 1"}`) {
 		t.Errorf("thinking delta missing: %s", joined)
 	}
-	// thinking 块关闭前有 signature_delta
-	if !strings.Contains(joined, "signature_delta") {
-		t.Errorf("signature missing: %s", joined)
+	// 切换不发签名（TS 语义，裁决 2026-08-03）
+	if strings.Contains(joined, "signature_delta") {
+		t.Errorf("no signature on thinking→text switch: %s", joined)
 	}
 	// text 块
 	if !strings.Contains(joined, `"delta":{"type":"text_delta","text":"answer"}`) {
 		t.Errorf("text delta missing: %s", joined)
+	}
+}
+
+func TestStreamSignatureAtEnd(t *testing.T) {
+	// 纯 thinking 响应（裁决 2026-08-03 跟随 TS）。
+	// 裁决指令初版预期"收尾 close_all 时 thinking 仍开 → 含 signature_delta"，
+	// 但实测 TS 参考实现（bun 运行 stream.ts，纯 reasoning + finish stop）
+	// 输出中签名数为 0：收尾前的 " " 占位文本块分支经 ensure_text_block
+	// 关闭 thinking 块（无签名）。按裁决总原则"断言同步按 TS 行为修正并注释
+	// 裁决"，此处修正为负向断言，并断言 TS 的 " " 占位块输出。
+	body := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think step 1\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, "signature_delta") {
+		t.Errorf("pure-thinking finalize emits no signature (TS): %s", joined)
+	}
+	if !strings.Contains(joined, `"thinking":"think step 1"`) {
+		t.Errorf("thinking missing: %s", joined)
+	}
+	if !strings.Contains(joined, `"text":" "`) {
+		t.Errorf("space placeholder text block missing (TS): %s", joined)
 	}
 }
 
@@ -194,6 +220,11 @@ func TestStreamRefusalAsText(t *testing.T) {
 }
 
 func TestStreamUsageBuckets(t *testing.T) {
+	// TS spread 语义（裁决 2026-08-03 跟随 TS）：`{...first, ...extract(latest)}`
+	// 中 extract 恒返回全字段，后到的裸 usage chunk 以 0 覆盖先前的缓存桶 →
+	// message_delta 的 input_tokens = 100 - 0 - 0 = 100，且不含 cache 字段
+	// （0 值经 omitempty 消失）。brief 原断言（缓存保留）与 TS 不符，按裁决
+	// 改为负向断言。
 	body := "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"cache_read_input_tokens\":30,\"cache_creation_input_tokens\":10}}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
@@ -201,14 +232,11 @@ func TestStreamUsageBuckets(t *testing.T) {
 		"data: [DONE]\n\n"
 	ev := allEvents(t, body, req(t, "m1"))
 	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, `"input_tokens":60`) {
-		t.Errorf("input = prompt - cache: %s", joined)
+	if !strings.Contains(joined, `"input_tokens":100`) {
+		t.Errorf("input = prompt - cache (cache wiped by later bare chunk): %s", joined)
 	}
-	if !strings.Contains(joined, `"cache_read_input_tokens":30`) {
-		t.Errorf("cache_read: %s", joined)
-	}
-	if !strings.Contains(joined, `"cache_creation_input_tokens":10`) {
-		t.Errorf("cache_creation: %s", joined)
+	if strings.Contains(joined, "cache_read_input_tokens") || strings.Contains(joined, "cache_creation_input_tokens") {
+		t.Errorf("cache buckets must be absent after bare usage chunk: %s", joined)
 	}
 	// message_start 里 output_tokens=1，message_delta 里真实值
 	if !strings.Contains(joined, `"output_tokens":20`) {
@@ -235,8 +263,34 @@ func TestStreamUsageFallbackDetails(t *testing.T) {
 }
 
 func TestStreamUpstreamErrorObject(t *testing.T) {
+	// 用户裁决 2026-08-03（第三次确认跟随 TS）：TS catch 块对两种错误类型
+	// 处理相同——hadContent → notice + message_delta/message_stop 优雅收尾，
+	// 生成器正常结束（Err() 为 nil），不 rethrow；仅无内容时才由 Err() 携带
+	// 错误。已用 bun 运行 TS 参考实现验证（error after content → 不抛）。
+	// brief 原断言（Err() 返回 UpstreamStreamError）与 TS 不符，按裁决修正。
 	body := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" +
 		"data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n"
+	chunks := chunksFromSSE(t, body)
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
+	ev, err := collect(t, st)
+	if err != nil {
+		t.Fatalf("hadContent → graceful completion, err = %v", err)
+	}
+	// 已有内容 → incomplete notice 分支
+	joined := strings.Join(ev, "\n")
+	if !strings.Contains(joined, "API Error: Server error mid-response. The response above may be incomplete.") {
+		t.Errorf("notice missing: %s", joined)
+	}
+	if !strings.Contains(joined, "message_delta") || !strings.Contains(joined, "message_stop") {
+		t.Errorf("turn must complete gracefully: %s", joined)
+	}
+}
+
+func TestStreamUpstreamErrorNoContent(t *testing.T) {
+	// error 对象作为第一个 chunk、无任何内容 → 无内容路径：Err() 携带
+	// UpstreamStreamError，事件仅 message_start，无 notice（TS 语义，裁决
+	// 2026-08-03；已用 bun 运行 TS 参考实现验证：rethrow "rate limited"）。
+	body := "data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n"
 	chunks := chunksFromSSE(t, body)
 	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
 	ev, err := collect(t, st)
@@ -247,10 +301,11 @@ func TestStreamUpstreamErrorObject(t *testing.T) {
 	if !errors.As(err, &usErr) || usErr.Code != 429 {
 		t.Fatalf("err = %v", err)
 	}
-	// 已有内容 → incomplete notice 分支
-	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, "API Error: Server error mid-response. The response above may be incomplete.") {
-		t.Errorf("notice missing: %s", joined)
+	if len(ev) != 1 {
+		t.Errorf("only message_start expected, got %d events", len(ev))
+	}
+	if strings.Contains(strings.Join(ev, "\n"), "API Error:") {
+		t.Errorf("no notice when no content: %v", ev)
 	}
 }
 
