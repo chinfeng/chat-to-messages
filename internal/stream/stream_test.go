@@ -476,26 +476,13 @@ func TestInferToolNameByIndex(t *testing.T) {
 	}
 }
 
-func TestStreamTaskRunInBackgroundForced(t *testing.T) {
-	// 多分片 Task 原生工具调用（评审修复 Important + 裁决意图）：参数跨 3 个
-	// chunk 到达。缓冲未完成时原始分片被暂扣（不发，避免泄漏 run_in_background:true
-	// 与重复/损坏拼接）；凑齐后只发一次 canonical 完整 JSON。断言：
-	//  1) 输出不出现 "run_in_background":true
-	//  2) 客户端累积的 partial_json 拼接是合法 JSON
-	//  3) 累积值 run_in_background=false、description="d"
-	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Task\",\"arguments\":\"{\\\"run_in_background\\\":true,\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"description\\\":\\\"\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"d\\\"}\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
-		"data: [DONE]\n\n"
-	ev := allEvents(t, body, req(t, "m1"))
-	joined := strings.Join(ev, "\n")
-	if strings.Contains(joined, `"run_in_background":true`) {
-		t.Errorf("run_in_background must never appear as true: %s", joined)
-	}
-	// 客户端累积的 partial_json 拼接必须为合法 JSON 且 run_in_background=false
+// accumulatedPartialJSON reconstructs the client-visible concatenation of all
+// input_json_delta partial_json payloads (what a downstream client accumulates
+// as the tool input).
+func accumulatedPartialJSON(t *testing.T, events []string) string {
+	t.Helper()
 	var acc strings.Builder
-	for _, e := range ev {
+	for _, e := range events {
 		for _, line := range strings.Split(e, "\n") {
 			if !strings.HasPrefix(line, "data: ") {
 				continue
@@ -510,15 +497,82 @@ func TestStreamTaskRunInBackgroundForced(t *testing.T) {
 			}
 		}
 	}
+	return acc.String()
+}
+
+// assertTaskToolInputValid asserts that the accumulated partial_json is valid
+// JSON whose run_in_background is false (the Task-buffer ruling's core intent).
+func assertTaskToolInputValid(t *testing.T, events []string) map[string]any {
+	t.Helper()
+	acc := accumulatedPartialJSON(t, events)
 	var parsed map[string]any
-	if err := json.Unmarshal([]byte(acc.String()), &parsed); err != nil {
-		t.Fatalf("accumulated partial_json must be valid JSON: %q: %v", acc.String(), err)
+	if err := json.Unmarshal([]byte(acc), &parsed); err != nil {
+		t.Fatalf("accumulated partial_json must be valid JSON: %q: %v", acc, err)
 	}
 	if parsed["run_in_background"] != false {
-		t.Errorf("run_in_background = %v, want false (accumulated: %q)", parsed["run_in_background"], acc.String())
+		t.Errorf("run_in_background = %v, want false (accumulated: %q)", parsed["run_in_background"], acc)
 	}
+	return parsed
+}
+
+func TestStreamTaskRunInBackgroundForced(t *testing.T) {
+	// 多分片 Task 原生工具调用（评审修复 Important + 裁决意图）：参数跨 3 个
+	// chunk 到达。缓冲未完成时原始分片被暂扣（不发，避免泄漏 run_in_background:true
+	// 与重复/损坏拼接）；凑齐后只发一次 canonical 完整 JSON。
+	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Task\",\"arguments\":\"{\\\"run_in_background\\\":true,\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"description\\\":\\\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"d\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, `"run_in_background":true`) {
+		t.Errorf("run_in_background must never appear as true: %s", joined)
+	}
+	parsed := assertTaskToolInputValid(t, ev)
 	if parsed["description"] != "d" {
-		t.Errorf("description = %v, want d (accumulated: %q)", parsed["description"], acc.String())
+		t.Errorf("description = %v, want d", parsed["description"])
+	}
+}
+
+func TestStreamTaskPreStartArgsBuffered(t *testing.T) {
+	// R1（评审）：Task 参数先于 name 到达——第一 chunk 只有 arguments（无
+	// name/id），第二 chunk 才补 name "Task"。工具 start 时补发的 pre-start
+	// 参数必须走 Task 缓冲路径（暂扣，凑齐后 canonical 一次发，run_in_background
+	// 强制 false），不得原始照发。
+	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"run_in_background\\\":true,\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Task\",\"arguments\":\"\\\"description\\\":\\\"d\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, `"run_in_background":true`) {
+		t.Errorf("run_in_background must never appear as true: %s", joined)
+	}
+	parsed := assertTaskToolInputValid(t, ev)
+	if parsed["description"] != "d" {
+		t.Errorf("description = %v, want d", parsed["description"])
+	}
+}
+
+func TestStreamOrphanTaskArgsBuffered(t *testing.T) {
+	// R2（评审）：name 完全缺失的孤儿工具经 InferToolNameByIndex 推断为
+	// "Task"（request.Tools[0]）→ preStartArgs 必须走 Task 缓冲/规范化路径
+	// （解析成功 → run_in_background=false 的 canonical JSON；失败 → 留给
+	// FlushTaskArgBuffers 发 "{}" + sha256 告警），而非 repair 后原始照发。
+	request := req(t, "m1")
+	request.Tools = []map[string]any{{"type": "custom", "name": "Task", "input_schema": map[string]any{}}}
+	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"run_in_background\\\":true,\\\"description\\\":\\\"d\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEvents(t, body, request)
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, `"run_in_background":true`) {
+		t.Errorf("run_in_background must never appear as true: %s", joined)
+	}
+	parsed := assertTaskToolInputValid(t, ev)
+	if parsed["description"] != "d" {
+		t.Errorf("description = %v, want d", parsed["description"])
 	}
 }
 

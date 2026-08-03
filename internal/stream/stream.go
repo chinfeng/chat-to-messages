@@ -496,10 +496,24 @@ func (s *Streamer) finalize(emit func(string)) {
 			emit(s.builder.StartToolBlock(toolIndex, resolvedID, inferredName))
 			// Attempt JSON repair on pre-start args.
 			if raw := preStartArgs; raw != "" {
-				repaired := repairTruncatedJson(raw)
-				s.toolArgAccum[toolIndex] = repaired
-				emit(s.builder.EmitToolDelta(toolIndex, repaired))
 				s.builder.SetToolPreStartArgs(toolIndex, "")
+				if inferredName == "Task" {
+					// A Task-named orphan takes the buffer path: parse success →
+					// canonical JSON with run_in_background forced false; a
+					// failure stays in the buffer for FlushTaskArgBuffers
+					// ("{}" + sha256 warning). Raw repair would leak
+					// run_in_background:true. (Review R2.)
+					if argsJSON := s.builder.BufferTaskArgs(toolIndex, raw); argsJSON != nil {
+						if canonical, err := convert.CanonicalJSONStringify(argsJSON); err == nil {
+							s.toolArgAccum[toolIndex] = canonical
+							emit(s.builder.EmitToolDelta(toolIndex, canonical))
+						}
+					}
+				} else {
+					repaired := repairTruncatedJson(raw)
+					s.toolArgAccum[toolIndex] = repaired
+					emit(s.builder.EmitToolDelta(toolIndex, repaired))
+				}
 			}
 		} else {
 			hasOrphanedToolStates = true
@@ -638,7 +652,22 @@ func (s *Streamer) processToolCall(emit func(string), tc openai.ToolCallDelta) {
 		emit(s.builder.StartToolBlock(tcIndex, resolvedID, resolvedName))
 		if pre := s.builder.ToolPreStartArgs(tcIndex); pre != "" {
 			s.builder.SetToolPreStartArgs(tcIndex, "")
-			emit(s.builder.EmitToolDelta(tcIndex, pre))
+			if resolvedName == "Task" {
+				// Pre-start args of a Task tool must take the buffer path too:
+				// held while incomplete, canonical JSON with run_in_background
+				// forced false when complete (finalize flush repairs buffers
+				// that never complete). A raw emit would leak
+				// run_in_background:true and leave the Task buffer starting
+				// from empty, so the client accumulates a corrupt
+				// concatenation. (Review R1.)
+				if argsJSON := s.builder.BufferTaskArgs(tcIndex, pre); argsJSON != nil {
+					if canonical, err := convert.CanonicalJSONStringify(argsJSON); err == nil {
+						emit(s.builder.EmitToolDelta(tcIndex, canonical))
+					}
+				}
+			} else {
+				emit(s.builder.EmitToolDelta(tcIndex, pre))
+			}
 		}
 	}
 
