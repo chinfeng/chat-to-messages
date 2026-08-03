@@ -1,0 +1,534 @@
+# chat-to-messages
+
+Convert any OpenAI Chat Completions compatible endpoint to the Anthropic Messages API, enabling Claude Code CLI to use it directly.
+
+[中文文档](README-zh.md)
+
+## Design Philosophy
+
+This project follows the Unix philosophy: **one process, one upstream endpoint**. If you need multiple upstreams (e.g. different models or providers), run multiple processes on different ports and let the client or a load balancer handle routing. Benefits:
+
+- Each process is simple, predictable, and easy to debug
+- No built-in routing state — processes are stateless, start and stop at will
+- Independent scaling and rolling upgrades without cross-contamination
+
+## Motivation
+
+Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), this project was created to provide a **lighter-weight alternative** for deployment:
+
+- **Smaller footprint** — Pure Go standard library with zero external dependencies, compiling to a single static binary with far less disk and memory usage than a Python + FastAPI stack
+- **Simplified routing** — Multi-upstream forwarding is removed entirely; only single-upstream OpenAI-to-Anthropic protocol translation remains
+- **Passthrough-friendly** — Auth token passthrough allows deploying on minimal servers (e.g. 1 vCPU / 1 GB RAM) without hardcoding upstream keys
+- **Multi-process scaling** — When multiple upstreams are needed, simply run one process per upstream on different ports, and let a reverse proxy or DNS route traffic
+
+### Multi-Upstream Example
+
+```bash
+# Process 1: NVIDIA NIM on port 8082
+./chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --port 8082
+
+# Process 2: OpenRouter on port 8083
+./chat-to-messages \
+  --upstream-base-url https://openrouter.ai/api/v1 \
+  --upstream-api-key sk-or-xxxx \
+  --port 8083
+```
+
+Then point Claude Code to the desired upstream:
+
+```bash
+# Use NVIDIA NIM
+ANTHROPIC_BASE_URL=http://localhost:8082 claude
+
+# Use OpenRouter
+ANTHROPIC_BASE_URL=http://localhost:8083 claude
+```
+
+Or place both behind a reverse proxy (nginx, Caddy, etc.) and route by domain or path.
+
+## How It Works
+
+```
+Claude Code CLI
+    │  Anthropic API (SSE)
+    ▼
+chat-to-messages ────► OpenAI /chat/completions (SSE)
+                            │  (NVIDIA NIM / OpenAI / Ollama / LM Studio / ...)
+    │  Anthropic SSE
+    ▼
+Claude Code CLI receives standard Anthropic response
+```
+
+Key features:
+
+- **Protocol conversion** — Anthropic Messages API ↔ OpenAI Chat Completions bidirectional translation
+- **Streaming SSE** — OpenAI streaming chunks converted to Anthropic SSE events in real time
+- **Thinking support** — Both `reasoning_content` and thinking tag formats are converted to Anthropic thinking blocks
+- **Tool calls** — Both native `tool_calls` and heuristic text-based `● <function=...>` parsing are supported
+- **Downstream auth** — Optional `--auth-token` for x-api-key verification of connecting clients
+- **Request dumping** — Optional `--dump <dir>` records full request/response for debugging
+- **Zero dependencies** — Pure Go standard library, no external packages
+
+## Quick Start
+
+### 1. Build the binary
+
+Requires [Go](https://go.dev/dl/) 1.26+:
+
+```bash
+go build -o chat-to-messages .
+```
+
+Produces a single static binary (`chat-to-messages` on Linux/macOS, `chat-to-messages.exe` on Windows).
+
+### 2. Start the proxy
+
+All configuration is passed via CLI arguments:
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx
+```
+
+Output:
+
+```
+chat-to-messages listening on http://localhost:8082
+  Upstream: https://integrate.api.nvidia.com/v1
+  Upstream API key: configured
+  Auth token: not set
+  Passthrough mode: false
+  Thinking: true
+  Dump: disabled
+  Web Search: false
+  Web Fetch: false
+```
+
+### 3. Connect Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8082"
+export ANTHROPIC_AUTH_TOKEN="your-token-here"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-ai/deepseek-v4-pro"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="qwen/qwen3.5-397b-a17b"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="minimaxai/minimax-m2.7"
+claude
+```
+
+Or as a one-liner:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
+```
+
+## CLI Arguments Reference
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--upstream-base-url` | `https://api.openai.com/v1` | Upstream OpenAI Chat Completions compatible endpoint |
+| `--upstream-api-key` | `""` | Upstream API key for authenticating with the upstream endpoint |
+| `--auth-token` | `""` | Downstream auth token; clients must provide a matching x-api-key header when set |
+| `--port` | `8082` | HTTP listen port |
+| `--enable-thinking` | `true` | Convert upstream reasoning content to Anthropic thinking blocks |
+| `--no-enable-thinking` | — | Disable thinking conversion |
+| `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
+| `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
+| `--enable-web-search` | `false` | Enable proxy-side web search |
+| `--web-search-engine` | `brave` | Search engine type: `brave` (Brave Search API) or `searxng` (SearXNG) |
+| `--enable-web-fetch` | `false` | Enable proxy-side web fetch (HTTP GET with domain filtering) |
+| `--web-search-api-key` | `""` | Search API key (required for Brave, optional for SearXNG) |
+| `--web-search-base-url` | `https://api.search.brave.com` | Search API base URL |
+| `--web-fetch-allowed-domain` | — | Allowed domain for web fetch (repeatable, e.g., `--web-fetch-allowed-domain example.com`) |
+| `--web-fetch-blocked-domain` | — | Blocked domain for web fetch (repeatable) |
+| `--web-fetch-max-content-tokens` | `5000` | Max content tokens for web fetch results |
+
+### Server Tools (Web Search & Web Fetch)
+
+This proxy can execute Anthropic-style `web_search` and `web_fetch` server tools on behalf of upstream models that don't natively support them. When a model emits a tool call matching `WebSearch` / `WebFetch` in its text output, the proxy intercepts it, executes the request, and returns the result as an Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` content block.
+
+#### Brave Search (default)
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-api-key BST-xxxx
+```
+
+#### SearXNG (self-hosted)
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://searxng.example.com
+```
+
+No `--web-search-api-key` is required for SearXNG unless your instance requires authentication.
+
+#### Both web search and web fetch
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://searxng.example.com \
+  --enable-web-fetch \
+  --web-fetch-allowed-domain docs.example.com \
+  --web-fetch-allowed-domain api.example.com
+```
+
+**How it works:**
+
+1. The client sends a request with `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]`
+2. The proxy detects the server tool types, strips them before forwarding to the upstream
+3. If the upstream model calls `WebSearch` / `WebFetch` (as heuristic text-based tool calls), the proxy intercepts them
+4. The proxy executes the call (Brave Search API or SearXNG for search, direct HTTP for fetch) and emits the result back to the client as Anthropic SSE events
+
+### Model-Specific Extra Parameters
+
+Use `--upstream-extra-params` to inject additional JSON fields into the upstream request body based on the model name. The format is `glob=JSON`:
+
+```bash
+--upstream-extra-params 'claude-*={"thinking":{"type":"enabled","budget_tokens":10000}}'
+```
+
+- **Glob pattern** — `*` matches any characters, `?` matches a single character. The first matching pattern wins.
+- **JSON value** — Must be a JSON object. Deep-merged into the upstream request body (nested objects are merged, arrays are replaced).
+- **Repeatable** — Specify multiple times for different model patterns.
+- **Processing order** — Regular merge → `$default` (fill missing) → `$delete` (remove).
+
+#### Meta-operation keys
+
+Two reserved keys prefixed with `$` control advanced behaviours (all other keys follow standard deep-merge: nested objects merged, arrays replaced, `null` overwrites):
+
+| Key | Type | Semantics |
+|-----|------|-----------|
+| `$delete` | `string[]` | Remove properties at the given **dot-notation paths** from the merged result. Silently no-ops when a path does not exist. |
+| `$default` | `Record<string, any>` | Set values **only when the path is missing** (`undefined`) in the target. Existing values are never overwritten. Supports dot-notation paths for nested defaults. |
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --upstream-extra-params 'claude-sonnet-*={"thinking":{"type":"enabled","budget_tokens":10000}}' \
+  --upstream-extra-params 'deepseek*={"reasoning_effort":"high"}' \
+  --upstream-extra-params '*={"stream":true}'
+```
+
+When a request arrives with `model: "claude-sonnet-4-20250514"`, the matching `claude-sonnet-*` pattern is selected and its JSON is merged into the upstream request body. The catch-all `*` pattern acts as a default for any unmatched model.
+
+##### Examples
+
+**Delete top-level or nested parameters:**
+
+```bash
+# Remove top-level keys
+--upstream-extra-params 'deepseek*={"$delete":["top_p","presence_penalty"],"reasoning_effort":"high"}'
+
+# Remove nested keys via dot-notation path
+--upstream-extra-params 'claude-*={"$delete":["thinking.budget_tokens"]}'
+
+# Remove nested keys via a nested $delete (paths relative to that level)
+--upstream-extra-params 'claude-*={"thinking":{"$delete":["budget_tokens"],"type":"enabled"}}'
+```
+
+**Provide defaults for missing parameters (won't overwrite existing values):**
+
+```bash
+# Only set max_tokens if the upstream body doesn't already have it
+--upstream-extra-params '*={"$default":{"max_tokens":4096,"temperature":0.7}}'
+
+# Nested defaults via dot-notation
+--upstream-extra-params 'claude-*={"$default":{"thinking.budget_tokens":10000}}'
+
+# Nested defaults via nested $default
+--upstream-extra-params 'claude-*={"thinking":{"$default":{"budget_tokens":10000}}}'
+```
+
+**Set a parameter to `null` (uses standard JSON `null`):**
+
+```bash
+--upstream-extra-params 'claude-*={"top_p":null}'
+```
+
+**Mix all three — delete, default, and override in one rule:**
+
+```bash
+--upstream-extra-params '*={"$delete":["user","seed"],"$default":{"max_tokens":4096},"temperature":0.2}'
+```
+
+### Passthrough Mode
+
+When both `--upstream-api-key` and `--auth-token` are unset, passthrough mode is automatically enabled: the key provided by the client via `x-api-key` or `Authorization` header is forwarded as-is to the upstream endpoint.
+
+### Downstream Auth
+
+When `--auth-token` is set, client requests must include a matching `x-api-key` or `Authorization: Bearer xxx` header, otherwise a 401 is returned. This protects the proxy from unauthorized access.
+
+### Request Dumping
+
+Enable `--dump <dir>` to log each downstream request into a sequentially numbered directory containing `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log`. On completion, the directory is renamed to `{seq}-{startTime}-{endTime}` for chronological sorting. Full SSE event streams are also captured.
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --dump /var/log/chat-to-messages
+```
+
+Example dump directory structure:
+
+```
+/var/log/chat-to-messages/
+└── 1-2026-05-20T08-30-00-000Z-2026-05-20T08-30-05-123Z/
+    ├── downstream-request.log
+    ├── downstream-response.log
+    ├── upstream-request.log
+    └── upstream-response.log
+```
+
+## Cross-Compilation
+
+Build a single static binary for any target platform (pure Go with `CGO_ENABLED=0`, so cross-compilation produces a fully static, self-contained executable):
+
+```bash
+# Current platform
+go build -o chat-to-messages .
+
+# Linux (amd64) — typical server target
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o chat-to-messages-linux-amd64 .
+
+# Windows (amd64)
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o chat-to-messages.exe .
+
+# macOS (arm64)
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o chat-to-messages-darwin-arm64 .
+```
+
+Each binary runs standalone — no runtime, interpreter, or shared libraries required.
+
+## Docker Deployment
+
+### Build image
+
+```bash
+docker build -t chat-to-messages .
+```
+
+The Dockerfile uses a multi-stage build: a `golang:1.26-alpine` builder produces a static `CGO_ENABLED=0` binary, which is copied into a minimal `alpine:3.22` runtime image with CA certificates.
+
+### Run container
+
+```bash
+docker run -p 8082:8082 chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx
+```
+
+With downstream auth:
+
+```bash
+docker run -p 8082:8082 chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --auth-token my-secret-token
+```
+
+Passthrough mode (no keys needed):
+
+```bash
+docker run -p 8082:8082 chat-to-messages \
+  --upstream-base-url http://localhost:11434/v1
+```
+
+## API Endpoints
+
+| Path | Method | Description |
+|------|--------|-------------|
+| `/v1/messages` | POST | Anthropic Messages API proxy (core endpoint) |
+| `/health` | GET | Health check |
+
+Unmatched paths return `404` with an Anthropic-format error body.
+
+**Note**: The `model` field is required in the request body; omitting it returns an error.
+
+## Conversion Details
+
+### Message Conversion
+
+| Anthropic | OpenAI | Description |
+|-----------|--------|-------------|
+| `system` (string / content blocks) | `{"role": "system", "content": "..."}` | System prompt extracted as system message |
+| `tool_use` block | `tool_calls[i]` | Tool call arguments JSON-serialized |
+| `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | Tool result serialized as tool message |
+| `thinking` block | thinking tag embedded in content | Controlled by `ReasoningReplayMode` |
+| `redacted_thinking` block | Replayed as `[redacted thinking]` placeholder | Preserves multi-turn reasoning chain |
+| `thinking` block (signature) | Preserved as `<!--sig:...-->` prefix in thinking tags | Round-trip signature preservation for multi-turn verification |
+| `document` block | Serialized as `[Document: filename (media_type)]` text | PDF/document awareness (binary not forwarded) |
+| `image` block (base64/url) | `image_url` content part | Anthropic image blocks converted to OpenAI format |
+
+### Streaming SSE Event Mapping
+
+| OpenAI chunk | Anthropic SSE event |
+|-------------|-------------------|
+| `delta.reasoning_content` | `content_block_start(thinking)` + `content_block_delta(thinking_delta)` |
+| `delta.content` (contains thinking tag) | Parsed and dispatched as thinking / text delta |
+| `delta.content` (plain text) | `content_block_delta(text_delta)` |
+| `delta.refusal` | `content_block_delta(text_delta)` — refusal forwarded as visible text |
+| `delta.tool_calls` | `content_block_start(tool_use)` + `content_block_delta(input_json_delta)` |
+| `delta.content` (WebSearch/WebFetch text) | `content_block_start(server_tool_use)` + `content_block_start(web_search_tool_result)` |
+| `finish_reason: "stop"` | `message_delta(stop_reason: "end_turn")` |
+| `finish_reason: "tool_calls"` | `message_delta(stop_reason: "tool_use")` |
+| thinking block close | `content_block_delta(signature_delta)` + `content_block_stop` |
+| `usage.prompt_tokens_details.cached_tokens` | `message_start.usage.cache_read_input_tokens` |
+| `usage.prompt_tokens_details.cache_write_tokens` | `message_start.usage.cache_creation_input_tokens` |
+| `event: ping` (heartbeat) | Injected every 15s during long streams |
+| in-stream error object | `event: error` with mapped error type (`overloaded_error` / `invalid_request_error` / `api_error`) |
+| `tool_choice.disable_parallel_tool_use: true` | `parallel_tool_calls: false` at request body root |
+| truncated tool_use input JSON | Auto-repaired via brace-balancing before `content_block_stop` |
+
+### Stop Reason Mapping
+
+| OpenAI | Anthropic |
+|--------|-----------|
+| `stop` | `end_turn` |
+| `length` | `max_tokens` |
+| `tool_calls` | `tool_use` |
+| `content_filter` | `refusal` |
+| other | `end_turn` |
+
+### Heuristic Tool Call Parsing
+
+Some models don't return native `tool_calls` but emit tool invocations as text:
+
+```
+● <function=read_file><parameter=path>/etc/hosts</parameter>
+```
+
+The parser converts these to structured `tool_use` blocks. It also supports WebFetch / WebSearch JSON text format:
+
+```
+Use WebFetch {"url": "https://example.com"}
+Use WebSearch {"query": "test query"}
+```
+
+## Provider Configuration Examples
+
+### NVIDIA NIM
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-your-key
+```
+
+### OpenAI
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-your-key
+```
+
+### Ollama (local)
+
+```bash
+./chat-to-messages \
+  --upstream-base-url http://localhost:11434/v1
+```
+
+### LM Studio (local)
+
+```bash
+./chat-to-messages \
+  --upstream-base-url http://localhost:1234/v1
+```
+
+### OpenRouter
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://openrouter.ai/api/v1 \
+  --upstream-api-key sk-or-your-key
+```
+
+## Development
+
+### Project Structure
+
+```
+main.go                        # Entry point: startup banner, HTTP server, graceful shutdown
+go.mod                         # module chat-to-messages (Go 1.26+)
+internal/
+├── anthropic/                 # Anthropic Messages API type definitions
+├── config/                    # CLI argument parsing, glob matching, extra-params deep merge
+├── convert/                   # Anthropic → OpenAI message/tool/system-prompt conversion
+├── dump/                      # Request/response dump logger
+├── openai/                    # OpenAI Chat Completions types + SSE stream parsing
+├── parsers/                   # Think tag streaming parser + heuristic tool call parser
+├── proxy/                     # HTTP routes, auth, CORS, SSE pump, agentic loop
+├── servertool/                # Proxy-side web_search / web_fetch execution
+├── sse/                       # Anthropic SSE event builder + error responses
+└── stream/                    # OpenAI stream → Anthropic SSE stream converter
+```
+
+### Run Tests
+
+```bash
+go test ./...
+```
+
+### Vet
+
+```bash
+go vet ./...
+```
+
+### Dev Mode (run from source)
+
+```bash
+go run . --upstream-base-url https://integrate.api.nvidia.com/v1 --upstream-api-key nvapi-xxxx
+```
+
+### Build
+
+```bash
+go build -o chat-to-messages .
+```
+
+## Differences from free-claude-code (Python)
+
+This project is a Go port of [chat-to-claude-code](https://github.com/chinfeng/chat-to-claude-code) (a TypeScript/Bun port of [free-claude-code](https://github.com/chinfeng/free-claude-code)), focused on core protocol conversion:
+
+| Feature | Python version | This project (Go) |
+|---------|---------------|-------------------|
+| Runtime | Python 3.14 + FastAPI | Go (single static binary) |
+| External deps | FastAPI, Pydantic, httpx, tiktoken, etc. | Zero (standard library only) |
+| Provider count | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1 (generic OpenAI-compatible endpoint) |
+| Model Router | Opus/Sonnet/Haiku multi-provider routing | None (single upstream) |
+| Configuration | Environment variables | CLI startup arguments |
+| Downstream auth | None | AUTH_TOKEN verification |
+| Executable | None | `go build` single binary |
+| Containerization | None | Dockerfile (multi-stage, alpine runtime) |
+| Request dump | None | --dump sequential directories |
+| Admin UI | Local web configuration UI | None |
+| Request optimization | quota mock / title skip / prefix detection / filepath mock | None |
+| Discord/Telegram Bot | Full bot integration | None |
+| Web Server Tools | Proxy-side web_search / web_fetch | Proxy-side web_search (Brave / SearXNG) / web_fetch |
+| Rate Limiting | Token bucket rate limiting | None |
+| Token counting | tiktoken (cl100k_base) | char/4 estimation |
+| Logging/tracing | loguru + structured trace | console + optional dump |
+
+## License
+
+MIT
