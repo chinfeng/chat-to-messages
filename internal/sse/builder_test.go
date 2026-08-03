@@ -108,15 +108,21 @@ func TestEnsureTextClosesThinking(t *testing.T) {
 	var events []string
 	events = append(events, b.EnsureThinkingBlock()...)
 	events = append(events, b.EnsureTextBlock()...)
-	// thinking start, then (signature_delta + thinking stop) + text start
-	if len(events) != 4 {
+	// thinking start, then (thinking stop + text start) — user ruling: follow
+	// TS (builder.ts ensure_text_block), no signature_delta on the
+	// thinking→text switch; the signature is only emitted when content
+	// blocks close (CloseContentBlocks).
+	if len(events) != 3 {
 		t.Fatalf("events = %d", len(events))
 	}
-	if !strings.Contains(events[1], "signature_delta") {
+	if !strings.Contains(events[1], `"type":"content_block_stop"`) {
 		t.Errorf("e1 = %s", events[1])
 	}
-	if !strings.Contains(events[3], `"content_block":{"type":"text"`) {
-		t.Errorf("e3 = %s", events[3])
+	if strings.Contains(events[1], "signature_delta") {
+		t.Errorf("e1 must not carry signature: %s", events[1])
+	}
+	if !strings.Contains(events[2], `"content_block":{"type":"text"`) {
+		t.Errorf("e2 = %s", events[2])
 	}
 }
 

@@ -319,14 +319,13 @@ func (b *Builder) EnsureThinkingBlock() []string {
 	return events
 }
 
-// EnsureTextBlock yields a signature_delta + stop for an open thinking block
-// (deliberate port divergence: the TS reference closes thinking without the
-// signature; we emit it so the signature covers all thinking text), then a
-// text block start when none is open.
+// EnsureTextBlock yields a stop for an open thinking block (following TS:
+// no signature_delta on the switch — the signature is only emitted when
+// content blocks close), then a text block start when none is open.
 func (b *Builder) EnsureTextBlock() []string {
 	var events []string
 	if b.blocks.thinkingStarted {
-		events = append(events, b.EmitSignatureDelta(), b.StopThinkingBlock())
+		events = append(events, b.StopThinkingBlock())
 	}
 	if !b.blocks.textStarted {
 		events = append(events, b.StartTextBlock())
