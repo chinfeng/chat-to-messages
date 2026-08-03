@@ -91,6 +91,49 @@ func TestIterSSEChunksReadError(t *testing.T) {
 	}
 }
 
+// doneThenErrReader 先吐出 [DONE] 完成标记，下一次 Read 返回连接错误：
+// 用于验证 [DONE] 之后不得再产出 Err chunk。
+type doneThenErrReader struct{ n int }
+
+func (r *doneThenErrReader) Read(p []byte) (int, error) {
+	if r.n > 0 {
+		r.n--
+		return copy(p, "data: [DONE]\n\n"), nil
+	}
+	return 0, errors.New("connection reset")
+}
+
+func TestIterSSEChunksNoErrAfterDone(t *testing.T) {
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), &doneThenErrReader{n: 1}, nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 1 || !chunks[0].Done {
+		t.Fatalf("chunks = %+v, want exactly the [DONE] sentinel", chunks)
+	}
+	if chunks[0].Err != nil {
+		t.Errorf("no Err expected after [DONE], got %v", chunks[0].Err)
+	}
+}
+
+func TestIterSSEChunksNoErrAfterDoneWithRaw(t *testing.T) {
+	var raw strings.Builder
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), &doneThenErrReader{n: 1}, &raw) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 1 || !chunks[0].Done {
+		t.Fatalf("chunks = %+v, want exactly the [DONE] sentinel", chunks)
+	}
+	if chunks[0].Err != nil {
+		t.Errorf("no Err expected after [DONE], got %v", chunks[0].Err)
+	}
+	// dump 路径：raw 仍须完整累积原始文本
+	if raw.String() != "data: [DONE]\n\n" {
+		t.Errorf("raw = %q", raw.String())
+	}
+}
+
 func TestChunkErrorObject(t *testing.T) {
 	var c Chunk
 	if err := decodeChunk(&c, `{"error":{"message":"rate limited","code":429}}`); err != nil {

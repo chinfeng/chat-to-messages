@@ -69,40 +69,47 @@ const doneSentinel = "[DONE]"
 // IterSSEChunks parses an OpenAI SSE stream: only "data:"-prefixed lines are
 // processed; "[DONE]" yields Chunk{Done:true}; JSON parse failures are
 // skipped; a read error yields one final Chunk{Err: err} and then stops.
+// After [DONE] no further chunks are produced: a subsequent read error must
+// not surface as Chunk{Err}, since the upstream response already completed.
 // raw, when non-nil, accumulates the full original text (including non-data
-// lines) so callers can dump the upstream stream verbatim. Line splitting
-// accepts both \n and \r\n. A bufio.Reader is used instead of bufio.Scanner
-// because Scanner truncates lines longer than 64KB.
+// lines) so callers can dump the upstream stream verbatim; when raw is set,
+// remaining text after [DONE] is still drained into it, but when raw is nil
+// the iterator stops reading immediately after [DONE]. Line splitting accepts
+// both \n and \r\n. A bufio.Reader is used instead of bufio.Scanner because
+// Scanner truncates lines longer than 64KB.
 func IterSSEChunks(ctx context.Context, r io.Reader, raw *strings.Builder) iter.Seq[Chunk] {
 	return func(yield func(Chunk) bool) {
 		br := bufio.NewReader(r)
+		done := false // [DONE] 之后只累积 raw，不再产出任何 chunk（含 Err）
 		for {
 			line, err := br.ReadString('\n')
 			if len(line) > 0 {
 				if raw != nil {
 					raw.WriteString(line)
 				}
-				line = strings.TrimRight(line, "\r\n")
-				if strings.HasPrefix(line, "data:") {
-					data := strings.TrimSpace(line[len("data:"):])
-					switch {
-					case data == doneSentinel:
-						if !yield(Chunk{Done: true}) {
-							return
-						}
-					default:
-						var c Chunk
-						if json.Unmarshal([]byte(data), &c) != nil {
-							continue // 非 JSON 内容（如 keepalive），跳过
-						}
-						if !yield(c) {
-							return
+				if !done {
+					if data, ok := parseDataLine(line); ok {
+						if data == doneSentinel {
+							if !yield(Chunk{Done: true}) {
+								return
+							}
+							if raw == nil {
+								return // 无 dump 需求：立即停止读取
+							}
+							done = true // 有 dump 需求：仅继续累积 raw
+						} else {
+							var c Chunk
+							if json.Unmarshal([]byte(data), &c) == nil {
+								if !yield(c) {
+									return
+								}
+							}
 						}
 					}
 				}
 			}
 			if err != nil {
-				if !errors.Is(err, io.EOF) {
+				if !done && !errors.Is(err, io.EOF) {
 					// 真实读错误：产出最后一个 chunk 后停止
 					if !yield(Chunk{Err: err}) {
 						return
@@ -112,4 +119,15 @@ func IterSSEChunks(ctx context.Context, r io.Reader, raw *strings.Builder) iter.
 			}
 		}
 	}
+}
+
+// parseDataLine extracts the payload of an SSE "data:" line, trimming the
+// line ending (CRLF/LF) and any whitespace around the value. ok is false for
+// lines that are not data fields.
+func parseDataLine(line string) (data string, ok bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
+	}
+	return strings.TrimSpace(line[len("data:"):]), true
 }
