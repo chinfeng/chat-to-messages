@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"strconv"
 	"strings"
 )
 
@@ -62,6 +63,33 @@ type PromptTokensDetails struct {
 type Error struct {
 	Message string `json:"message,omitempty"`
 	Code    *int64 `json:"code,omitempty"`
+}
+
+// UnmarshalJSON tolerates both numeric and string error codes: OpenAI sends
+// numbers, but OpenRouter / newapi / GLM-family upstreams emit string codes
+// like "E429". A numeric string is converted to int64; a non-numeric string
+// (and a missing or null code) yields nil — the stream layer then falls back
+// to 500, mirroring the TS `typeof code === "number" ? code : 500` in
+// stream.ts. Without this, a string code made the whole chunk fail JSON
+// parsing and the error was silently dropped.
+func (e *Error) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Message string          `json:"message"`
+		Code    json.RawMessage `json:"code"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	e.Message = raw.Message
+	e.Code = nil
+	if len(raw.Code) > 0 {
+		// Accept both `"code": 429` and `"code": "429"` (strip JSON quotes
+		// for the string form); anything else parses to nil.
+		if n, err := strconv.ParseInt(strings.Trim(string(raw.Code), `"`), 10, 64); err == nil {
+			e.Code = &n
+		}
+	}
+	return nil
 }
 
 const doneSentinel = "[DONE]"

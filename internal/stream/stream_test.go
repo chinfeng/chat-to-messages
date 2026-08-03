@@ -309,6 +309,45 @@ func TestStreamUpstreamErrorNoContent(t *testing.T) {
 	}
 }
 
+// TestStreamUpstreamErrorStringCode: a non-numeric string code ("E429",
+// OpenRouter/newapi/GLM style) must surface as an UpstreamStreamError with the
+// TS fallback code 500 (`typeof err.code === "number" ? err.code : 500`).
+func TestStreamUpstreamErrorStringCode(t *testing.T) {
+	body := "data: {\"error\":{\"message\":\"rate limited\",\"code\":\"E429\"}}\n\n"
+	chunks := chunksFromSSE(t, body)
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
+	ev, err := collect(t, st)
+	if err == nil {
+		t.Fatal("expected UpstreamStreamError")
+	}
+	var usErr *UpstreamStreamError
+	if !errors.As(err, &usErr) {
+		t.Fatalf("err = %T, want *UpstreamStreamError", err)
+	}
+	if usErr.Message != "rate limited" || usErr.Code != 500 {
+		t.Errorf("stream error = %+v, want code 500 (string-code fallback)", usErr)
+	}
+	if len(ev) != 1 {
+		t.Errorf("only message_start expected, got %d events", len(ev))
+	}
+}
+
+// TestStreamUpstreamErrorNumericStringCode: a numeric STRING code ("429") is
+// converted by openai.Error.UnmarshalJSON and surfaces as-is.
+func TestStreamUpstreamErrorNumericStringCode(t *testing.T) {
+	body := "data: {\"error\":{\"message\":\"rate limited\",\"code\":\"429\"}}\n\n"
+	chunks := chunksFromSSE(t, body)
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
+	_, err := collect(t, st)
+	if err == nil {
+		t.Fatal("expected UpstreamStreamError")
+	}
+	var usErr *UpstreamStreamError
+	if !errors.As(err, &usErr) || usErr.Code != 429 {
+		t.Fatalf("err = %v, want UpstreamStreamError with code 429", err)
+	}
+}
+
 func TestStreamAbortBeforeContent(t *testing.T) {
 	body := "data: {\"choices\":[{\"delta\":{}}]}\n\n" // 无 finish_reason、无 [DONE]
 	chunks := chunksFromSSE(t, body)
@@ -855,6 +894,10 @@ func TestStreamGLMTextThenIncompleteTool(t *testing.T) {
 	toolPos := strings.Index(joined, `"type":"tool_use"`)
 	if textPos == -1 || toolPos == -1 || textPos > toolPos {
 		t.Errorf("text must precede tool_use: text@%d tool@%d", textPos, toolPos)
+	}
+	// The GLM text spanning chunks 1-3 must be preserved in full (账本记录缺失).
+	if !strings.Contains(joined, "用 Chrome DevTools 截图查看当前页面状态") {
+		t.Errorf("GLM text content missing: %s", joined)
 	}
 	if !strings.Contains(joined, `"name":"chrome-devtools-mcp:chrome-devtools"`) {
 		t.Errorf("inferred name missing: %s", joined)

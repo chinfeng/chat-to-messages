@@ -262,6 +262,9 @@ func (s *Streamer) iterate(emit func(string), stop *bool) error {
 		}
 		// Detect upstream error objects embedded in the SSE stream.
 		if chunk.Error != nil {
+			// TS stream.ts: `const code = typeof err.code === "number" ? err.code : 500`.
+			// Error.Code is nil for non-numeric string codes (e.g. "E429") and
+			// missing codes, so both fall back to 500 here.
 			code := int64(500)
 			if chunk.Error.Code != nil {
 				code = *chunk.Error.Code

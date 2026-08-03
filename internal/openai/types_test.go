@@ -144,6 +144,55 @@ func TestChunkErrorObject(t *testing.T) {
 	}
 }
 
+// TestChunkErrorObjectStringCode: OpenRouter / newapi / GLM-family upstreams
+// send string error codes like "E429" or "429". A numeric string is converted;
+// a non-numeric string yields nil (the stream layer falls back to 500).
+func TestChunkErrorObjectStringCode(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"error":{"message":"rate limited","code":"E429"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Error == nil || c.Error.Message != "rate limited" || c.Error.Code != nil {
+		t.Errorf("non-numeric string code should decode to nil: %+v", c.Error)
+	}
+
+	c = Chunk{}
+	if err := decodeChunk(&c, `{"error":{"message":"x","code":"429"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Error == nil || c.Error.Code == nil || *c.Error.Code != 429 {
+		t.Errorf("numeric string code should convert: %+v", c.Error)
+	}
+
+	c = Chunk{}
+	if err := decodeChunk(&c, `{"error":{"message":"x"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Error == nil || c.Error.Code != nil {
+		t.Errorf("missing code should decode to nil: %+v", c.Error)
+	}
+}
+
+// TestIterSSEChunksErrorChunkStringCode: a string-code error chunk must now
+// parse (previously the whole chunk failed JSON decoding and was silently
+// dropped, misreading the stream as a normal completion or a retryable abort).
+func TestIterSSEChunksErrorChunkStringCode(t *testing.T) {
+	body := "data: {\"error\":{\"message\":\"rate limited\",\"code\":\"E429\"}}\n\ndata: [DONE]\n\n"
+	var chunks []Chunk
+	for c := range IterSSEChunks(t.Context(), strings.NewReader(body), nil) {
+		chunks = append(chunks, c)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d: %+v", len(chunks), chunks)
+	}
+	if chunks[0].Error == nil || chunks[0].Error.Message != "rate limited" || chunks[0].Error.Code != nil {
+		t.Errorf("error chunk = %+v", chunks[0].Error)
+	}
+	if !chunks[1].Done {
+		t.Errorf("last chunk = %+v, want [DONE]", chunks[1])
+	}
+}
+
 func TestChunkToolCallDelta(t *testing.T) {
 	var c Chunk
 	if err := decodeChunk(&c, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":"}}],"finish_reason":null}}]}`); err != nil {
