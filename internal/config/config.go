@@ -38,6 +38,7 @@ type Config struct {
 	EnableThinking  bool
 	DumpDir         string
 	ModelOverrides  []ModelOverride
+	ConvertModels   []string
 	ServerTools     ServerToolConfig
 }
 
@@ -169,6 +170,7 @@ func Load(args []string) *Config {
 		EnableThinking:  getBool("enable-thinking", true),
 		DumpDir:         getArg("dump", ""),
 		ModelOverrides:  modelOverrides,
+		ConvertModels:   getMultiArg("convert-model"),
 		ServerTools:     serverTools,
 	}
 }
@@ -197,4 +199,21 @@ func ResolveModelExtra(model string, overrides []ModelOverride) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+// ShouldConvert reports whether model should go through the Anthropic→OpenAI
+// conversion path. An empty patterns slice (no --convert-model configured)
+// means convert ALL models (default, backward compatible). Otherwise only
+// models matching a pattern (via GlobMatch) convert; the rest pass through
+// natively to the upstream /v1/messages without conversion.
+func ShouldConvert(model string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, p := range patterns {
+		if GlobMatch(p, model) {
+			return true
+		}
+	}
+	return false
 }

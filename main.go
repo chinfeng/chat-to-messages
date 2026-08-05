@@ -39,6 +39,9 @@ func main() {
 			fmt.Printf("    %s -> %s\n", e.Pattern, extra)
 		}
 	}
+	if len(cfg.ConvertModels) > 0 {
+		fmt.Printf("  Convert models: %s\n", joinAll(cfg.ConvertModels))
+	}
 	fmt.Printf("  Web Search: %v\n", cfg.ServerTools.WebSearch)
 	fmt.Printf("  Web Fetch: %v\n", cfg.ServerTools.WebFetch)
 	if cfg.ServerTools.WebSearch {

@@ -275,6 +275,100 @@ func buildUpstreamRequestBodyOnly(cfg *config.Config, requestData *convert.Reque
 	return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions", wire, nil
 }
 
+// handlePassthrough forwards the original Anthropic /v1/messages request body
+// verbatim to the upstream's /v1/messages endpoint and streams the upstream's
+// Anthropic SSE response back to the client unchanged — no Anthropic→OpenAI
+// conversion in either direction. Used for models NOT selected by
+// --convert-model (e.g. an upstream that natively speaks the Anthropic
+// protocol for that model). Auth/key resolution is shared with the convert
+// path; the dump records the raw upstream request/response.
+func handlePassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, apiKey string, rawBody []byte, requestStart time.Time) {
+	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/v1/messages"
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(rawBody))
+	if err != nil {
+		session.Finish()
+		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+	session.WriteUpstreamRequest(headerMap(upstreamReq.Header), time.Now().UTC().Format(time.RFC3339), string(rawBody))
+
+	client := &http.Client{}
+	upstreamRes, err := client.Do(upstreamReq)
+	if err != nil {
+		handleUpstreamConnectError(w, session, r, requestStart, err)
+		return
+	}
+	defer upstreamRes.Body.Close()
+	ttfb := time.Since(requestStart).Milliseconds()
+	upstreamHeaders := headerMap(upstreamRes.Header)
+	upstreamStatus := upstreamRes.StatusCode
+
+	if upstreamRes.StatusCode < 200 || upstreamRes.StatusCode >= 300 {
+		handleUpstreamErrorStatus(w, session, requestStart, upstreamRes, upstreamHeaders, upstreamStatus, ttfb)
+		return
+	}
+	if upstreamRes.Body == nil || upstreamRes.Body == http.NoBody {
+		handleUpstreamEmptyBody(w, session, requestStart, upstreamHeaders, upstreamStatus, ttfb)
+		return
+	}
+
+	// --- Success: stream the upstream Anthropic response through verbatim ---
+	w.Header().Set("Content-Type", "text/event-stream")
+	for k, v := range upstreamSSEHeaders {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusOK)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		session.Finish()
+		return
+	}
+
+	var rawUpstream strings.Builder
+	flushBuf := make([]byte, 4096)
+	for {
+		n, readErr := upstreamRes.Body.Read(flushBuf)
+		if n > 0 {
+			chunk := flushBuf[:n]
+			rawUpstream.Write(chunk)
+			if _, werr := w.Write(chunk); werr != nil {
+				// downstream gone — stop reading
+				finalizePassthroughDump(session, upstreamHeaders, upstreamStatus, rawUpstream.String(), ttfb, requestStart, dump.ClientAbort)
+				return
+			}
+			flusher.Flush()
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	reason := dump.Completed
+	if r.Context().Err() != nil {
+		reason = dump.ClientAbort
+	}
+	finalizePassthroughDump(session, upstreamHeaders, upstreamStatus, rawUpstream.String(), ttfb, requestStart, reason)
+}
+
+// finalizePassthroughDump writes the upstream/downstream response dump entries
+// for a native-passthrough request and closes the session.
+func finalizePassthroughDump(session *dump.Session, upstreamHeaders map[string]string, upstreamStatus int, rawUpstream string, ttfb int64, requestStart time.Time, reason dump.TerminationReason) {
+	term := &dump.Termination{Reason: reason}
+	if reason != dump.Completed {
+		term.DisconnectTime = time.Now().UTC().Format(time.RFC3339)
+	}
+	session.WriteUpstreamResponse(upstreamHeaders, upstreamStatus, rawUpstream, term)
+	downstreamHeaders := map[string]string{"Content-Type": "text/event-stream"}
+	for k, v := range upstreamSSEHeaders {
+		downstreamHeaders[k] = v
+	}
+	session.WriteDownstreamResponse(downstreamHeaders, http.StatusOK, rawUpstream, term)
+	session.SetTiming(ttfb, time.Since(requestStart).Milliseconds())
+	session.Finish()
+}
+
 // handleMessages handles POST /v1/messages (port of handleMessages() in
 // routes.ts): auth, body validation, upstream request, and the SSE pump.
 func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
@@ -329,6 +423,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	if req.Model == "" {
 		session.Finish()
 		writeJSON(w, http.StatusBadRequest, invalidRequestError("`model` is required and must be a string."))
+		return
+	}
+	// Route by model: --convert-model selects models that go through the
+	// Anthropic→OpenAI conversion path. Models NOT selected pass through
+	// natively — the raw Anthropic body is forwarded to the upstream
+	// /v1/messages and the upstream's Anthropic response is streamed back
+	// verbatim, with no conversion. An empty --convert-model list (default)
+	// converts every model (backward compatible).
+	if !config.ShouldConvert(req.Model, cfg.ConvertModels) {
+		handlePassthrough(w, r, cfg, session, apiKey, rawBody, requestStart)
 		return
 	}
 	// A nil Messages slice means the JSON had no (or null) `messages` field —

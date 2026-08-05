@@ -349,3 +349,57 @@ func TestResolveModelExtraFullOverrides(t *testing.T) {
 		t.Errorf("nil overrides: %v", got)
 	}
 }
+
+// --convert-model collects repeatable glob patterns in order (--name value
+// and --name=value forms both supported), mirroring --web-fetch-allowed-domain.
+func TestLoadConvertModels(t *testing.T) {
+	cfg := Load([]string{
+		"--convert-model", "claude-*",
+		"--convert-model=gpt-4o",
+		"--convert-model", "deepseek-*-pro",
+	})
+	want := []string{"claude-*", "gpt-4o", "deepseek-*-pro"}
+	if !reflect.DeepEqual(cfg.ConvertModels, want) {
+		t.Errorf("ConvertModels = %#v, want %#v", cfg.ConvertModels, want)
+	}
+}
+
+// Default: no --convert-model → empty list (ShouldConvert then returns true
+// for any model, i.e. convert all — backward compatible).
+func TestLoadConvertModelsDefault(t *testing.T) {
+	cfg := Load(nil)
+	if len(cfg.ConvertModels) != 0 {
+		t.Errorf("ConvertModels = %#v, want empty", cfg.ConvertModels)
+	}
+}
+
+// ShouldConvert: empty patterns → convert all; glob match → convert; multiple
+// patterns union; non-match → false (native passthrough).
+func TestShouldConvert(t *testing.T) {
+	// empty patterns → convert everything (default behavior)
+	if !ShouldConvert("anything", nil) {
+		t.Error("empty patterns should convert all")
+	}
+	if !ShouldConvert("anything", []string{}) {
+		t.Error("empty (non-nil) patterns should convert all")
+	}
+
+	// single glob: match converts, non-match passes through
+	if !ShouldConvert("claude-sonnet-4", []string{"claude-*"}) {
+		t.Error("claude-* should convert claude-sonnet-4")
+	}
+	if ShouldConvert("llama-3", []string{"claude-*"}) {
+		t.Error("claude-* should not convert llama-3 (passthrough)")
+	}
+
+	// multiple patterns union (any match → convert)
+	if !ShouldConvert("gpt-4o", []string{"claude-*", "gpt-4o"}) {
+		t.Error("gpt-4o should convert via second pattern")
+	}
+	if !ShouldConvert("claude-opus-4", []string{"claude-*", "gpt-4o"}) {
+		t.Error("claude-opus-4 should convert via first pattern")
+	}
+	if ShouldConvert("llama-3", []string{"claude-*", "gpt-4o"}) {
+		t.Error("llama-3 should not convert (no pattern matches)")
+	}
+}

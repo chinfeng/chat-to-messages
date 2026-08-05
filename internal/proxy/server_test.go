@@ -352,6 +352,101 @@ func TestInvalidJSONAndModel(t *testing.T) {
 	}
 }
 
+// recordingUpstream routes by path: it records the request body and URL path
+// of the last hit, then writes body verbatim with the given status. This lets
+// a single upstream distinguish the convert path (/chat/completions) from the
+// native passthrough path (/v1/messages).
+func recordingUpstream(t *testing.T, body string, status int) (*httptest.Server, func() (path, body string)) {
+	t.Helper()
+	var mu sync.Mutex
+	var lastPath, lastBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rb, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		lastPath = r.URL.Path
+		lastBody = string(rb)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() (string, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return lastPath, lastBody
+	}
+}
+
+// convertConfig builds a test config pointing at upstreamURL with the given
+// --convert-model patterns (testConfig otherwise).
+func convertConfig(upstreamURL string, convertModels []string) *config.Config {
+	cfg := testConfig(upstreamURL)
+	cfg.ConvertModels = convertModels
+	return cfg
+}
+
+// A model selected by --convert-model goes through the conversion path and
+// reaches the upstream /chat/completions.
+func TestConvertModelReachesChatCompletions(t *testing.T) {
+	up, last := recordingUpstream(t, "data: [DONE]\n\n", 200)
+	h := NewHandler(convertConfig(up.URL, []string{"claude-*"}))
+
+	resp := postMessages(t, h, `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("convert model: status = %d, want 200", resp.StatusCode)
+	}
+	path, _ := last()
+	if path != "/chat/completions" {
+		t.Errorf("convert model should hit /chat/completions, got %q", path)
+	}
+}
+
+// A model NOT selected by --convert-model passes through natively: the raw
+// Anthropic body is forwarded to /v1/messages and the upstream response is
+// streamed back verbatim.
+func TestPassthroughModelForwardsToVMessages(t *testing.T) {
+	// Upstream returns Anthropic-shaped SSE; the client should receive it as-is.
+	anthropicSSE := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	up, last := recordingUpstream(t, anthropicSSE, 200)
+	h := NewHandler(convertConfig(up.URL, []string{"claude-*"}))
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}],"max_tokens":1024}`
+	resp := postMessages(t, h, body, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("passthrough model: status = %d, want 200", resp.StatusCode)
+	}
+	path, recvBody := last()
+	if path != "/v1/messages" {
+		t.Errorf("passthrough model should hit /v1/messages, got %q", path)
+	}
+	// The raw Anthropic body must be forwarded verbatim (no conversion).
+	if recvBody != body {
+		t.Errorf("passthrough body not verbatim.\n got: %s\nwant: %s", recvBody, body)
+	}
+	// And the upstream response is streamed through unchanged.
+	if got := readBody(t, resp); got != anthropicSSE {
+		t.Errorf("passthrough response not verbatim.\n got: %s\nwant: %s", got, anthropicSSE)
+	}
+}
+
+// Default (no --convert-model) converts every model — backward compatible.
+func TestNoConvertModelsConvertsAll(t *testing.T) {
+	up, last := recordingUpstream(t, "data: [DONE]\n\n", 200)
+	h := NewHandler(convertConfig(up.URL, nil))
+
+	resp := postMessages(t, h, `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("default should convert any model: status = %d, want 200", resp.StatusCode)
+	}
+	path, _ := last()
+	if path != "/chat/completions" {
+		t.Errorf("default should hit /chat/completions, got %q", path)
+	}
+}
+
 func TestUpstreamErrorMapping(t *testing.T) {
 	up := mockUpstream(t, `{"error":"rate limited"}`, 429)
 	h := NewHandler(testConfig(up.URL))
