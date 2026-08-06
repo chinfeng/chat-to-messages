@@ -62,6 +62,24 @@ func authenticationError(message string) apiErrorBody {
 func notFoundError(message string) apiErrorBody { return errorBody("not_found_error", message) }
 func serverError(message string) apiErrorBody   { return errorBody("api_error", message) }
 
+// openAIErrorBody is the OpenAI-format error response body used by the
+// passthrough routes (served to OpenAI-format clients, so the body must match
+// the shape the OpenAI SDKs parse: {"error":{message,type,param}}).
+type openAIErrorBody struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Param   any    `json:"param"`
+	} `json:"error"`
+}
+
+func openAIError(errorType, message string) openAIErrorBody {
+	var b openAIErrorBody
+	b.Error.Type = errorType
+	b.Error.Message = message
+	return b
+}
+
 // upstreamError prefixes the message with "Upstream error: " exactly like the
 // TS upstreamError() helper.
 func upstreamError(message string) apiErrorBody {
@@ -136,6 +154,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
 		handleMessages(w, r, cfg)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+		forwardPassthrough(w, r, cfg, "/chat/completions")
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+		forwardPassthrough(w, r, cfg, "/models")
 	default:
 		writeJSON(w, http.StatusNotFound, notFoundError(fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path)))
 	}
@@ -597,4 +619,85 @@ func handleUpstreamEmptyBody(w http.ResponseWriter, session *dump.Session, reque
 	session.SetTiming(ttfb, time.Since(requestStart).Milliseconds())
 	session.Finish()
 	writeJSON(w, http.StatusInternalServerError, errBody)
+}
+
+// flushWriter wraps a ResponseWriter so every Write is followed by a Flush,
+// delivering streamed upstream SSE to the client incrementally.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	fw.f.Flush()
+	return n, err
+}
+
+// forwardPassthrough relays a request to the upstream verbatim: same method,
+// same body, resolved Authorization header. The upstream response (status
+// code, Content-Type, body) is relayed unchanged. Used by POST
+// /v1/chat/completions and GET /v1/models.
+func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, upstreamPath string) {
+	if !validateAuthToken(r, cfg) {
+		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
+		return
+	}
+	apiKey := resolveAPIKey(r, cfg)
+	if apiKey == "" {
+		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+		return
+	}
+
+	var body io.Reader
+	if r.Body != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error", "Invalid request body."))
+			return
+		}
+		body = bytes.NewReader(raw)
+	}
+
+	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + upstreamPath
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, url, body)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", err.Error()))
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		upstreamReq.Header.Set("Content-Type", ct)
+	} else {
+		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	// The request context is the abort signal: client disconnect cancels the
+	// upstream fetch (same contract as handleMessages).
+	client := &http.Client{}
+	upstreamRes, err := client.Do(upstreamReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, openAIError("api_error", "Upstream error: "+err.Error()))
+		return
+	}
+	defer upstreamRes.Body.Close()
+
+	// Relay the upstream response verbatim: status, Content-Type, body.
+	ct := upstreamRes.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	if strings.Contains(ct, "text/event-stream") {
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(upstreamRes.StatusCode)
+	if flusher, ok := w.(http.Flusher); ok {
+		_, _ = io.Copy(flushWriter{w: w, f: flusher}, upstreamRes.Body)
+	} else {
+		_, _ = io.Copy(w, upstreamRes.Body)
+	}
 }

@@ -31,6 +31,7 @@ func main() {
 	fmt.Printf("  Auth token: %s\n", boolWord(cfg.AuthToken != ""))
 	fmt.Printf("  Passthrough mode: %v\n", passthrough)
 	fmt.Printf("  Thinking: %v\n", cfg.EnableThinking)
+	fmt.Printf("  OpenAI passthrough: /v1/chat/completions, /v1/models\n")
 	fmt.Printf("  Dump: %s\n", orDisabled(cfg.DumpDir))
 	if len(cfg.ModelOverrides) > 0 {
 		fmt.Printf("  Model overrides:\n")

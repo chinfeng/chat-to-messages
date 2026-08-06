@@ -374,6 +374,8 @@ docker run -p 8082:8082 chat-to-messages \
 | Path | Method | Description |
 |------|--------|-------------|
 | `/v1/messages` | POST | Anthropic Messages API proxy (core endpoint) |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions passthrough (verbatim, no conversion) |
+| `/v1/models` | GET | OpenAI Models passthrough (verbatim) |
 | `/health` | GET | Health check |
 
 Unmatched paths return `404` with an Anthropic-format error body.

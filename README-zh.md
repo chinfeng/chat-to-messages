@@ -374,6 +374,8 @@ docker run -p 8082:8082 chat-to-messages \
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/v1/messages` | POST | Anthropic Messages API 代理（核心端点） |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 透传（原样转发，不转换） |
+| `/v1/models` | GET | OpenAI Models 透传（原样转发） |
 | `/health` | GET | 健康检查 |
 
 未匹配路径返回 `404` + Anthropic 格式错误体。

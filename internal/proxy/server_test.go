@@ -260,6 +260,14 @@ func TestHealthAndNotFound(t *testing.T) {
 	if rec2.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Error("404 response missing CORS")
 	}
+
+	// Bare /models is NOT registered (only /v1/models); it falls through to the
+	// default 404 case.
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest("GET", "/models", nil))
+	if rec3.Code != 404 {
+		t.Fatalf("404 expected for bare /models, got %d", rec3.Code)
+	}
 }
 
 func TestAuthTokenRequired(t *testing.T) {
@@ -1090,6 +1098,180 @@ func TestEmptyUpstreamBody500(t *testing.T) {
 	body := readBody(t, resp)
 	if !strings.Contains(body, "Upstream returned empty body.") {
 		t.Errorf("body = %s", body)
+	}
+}
+
+func TestChatCompletionsPassthroughVerbatim(t *testing.T) {
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"extra":"保留"}` // 含非 ASCII + 未知 key
+	var capturedBody string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		capturedBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	h := NewHandler(testConfig(up.URL))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// Body forwarded byte-for-byte (including the non-ASCII bytes).
+	if capturedBody != body {
+		t.Errorf("upstream body mismatch:\n got: %q\nwant: %q", capturedBody, body)
+	}
+	// Response relayed verbatim + CORS.
+	out := rec.Body.String()
+	if !strings.Contains(out, "chat.completion.chunk") || !strings.Contains(out, "[DONE]") {
+		t.Errorf("response not relayed verbatim: %s", out)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Error("CORS missing")
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	// SSE keep-alive headers present for event-stream responses.
+	if rec.Header().Get("X-Accel-Buffering") != "no" {
+		t.Error("X-Accel-Buffering missing on SSE passthrough")
+	}
+}
+
+func TestChatCompletionsPassthroughNonStream(t *testing.T) {
+	jsonBody := `{"id":"cmpl-1","object":"chat.completion","model":"m","choices":[{"message":{"role":"assistant","content":"hi"}}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, jsonBody)
+	}))
+	defer up.Close()
+	h := NewHandler(testConfig(up.URL))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[],"stream":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != jsonBody {
+		t.Errorf("non-stream body not relayed verbatim:\n got: %q\nwant: %q", got, jsonBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	// Non-event-stream responses must NOT carry SSE keep-alive headers.
+	if rec.Header().Get("X-Accel-Buffering") != "" {
+		t.Error("X-Accel-Buffering set on non-stream response")
+	}
+}
+
+func TestModelsPassthrough(t *testing.T) {
+	models := `{"object":"list","data":[{"id":"gpt-4o","object":"model","owned_by":"openai"}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/models" {
+			t.Errorf("upstream got %s %s, want GET /models", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, models)
+	}))
+	defer up.Close()
+	h := NewHandler(testConfig(up.URL))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != models {
+		t.Errorf("models body not relayed verbatim:\n got: %q\nwant: %q", got, models)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Error("CORS missing")
+	}
+}
+
+func TestChatCompletionsPassthroughForwardsClientKey(t *testing.T) {
+	var gotAuth string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	cfg := testConfig(up.URL)
+	cfg.UpstreamAPIKey = ""
+	cfg.AuthToken = "" // 透传模式
+	h := NewHandler(cfg)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "client-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(gotAuth, "client-key") {
+		t.Errorf("client key not forwarded: %q", gotAuth)
+	}
+}
+
+func TestPassthroughAuthRequired(t *testing.T) {
+	up := mockUpstream(t, "data: [DONE]\n\n", 200)
+	cfg := testConfig(up.URL)
+	cfg.AuthToken = "secret"
+	h := NewHandler(cfg)
+
+	// POST /v1/chat/completions without token → 401.
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatalf("chat completions 401 expected, got %d", rec.Code)
+	}
+	// OpenAI-format error body (passthrough clients parse this shape).
+	if !strings.Contains(rec.Body.String(), `"error"`) || !strings.Contains(rec.Body.String(), "authentication_error") {
+		t.Errorf("auth error body = %s", rec.Body.String())
+	}
+
+	// GET /v1/models without token → 401.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec2.Code != 401 {
+		t.Fatalf("models 401 expected, got %d", rec2.Code)
+	}
+
+	// With correct x-api-key → 200.
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("x-api-key", "secret")
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, req2)
+	if rec3.Code != 200 {
+		t.Fatalf("200 expected with token, got %d", rec3.Code)
+	}
+}
+
+func TestModelsPassthroughMissingKey401(t *testing.T) {
+	// Passthrough mode (no upstream key, no auth token) with no client key:
+	// resolveAPIKey yields empty → 401.
+	up := mockUpstream(t, "data: [DONE]\n\n", 200)
+	cfg := testConfig(up.URL)
+	cfg.UpstreamAPIKey = ""
+	cfg.AuthToken = ""
+	h := NewHandler(cfg)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 401 {
+		t.Fatalf("401 expected (passthrough mode, no client key), got %d", rec.Code)
 	}
 }
 
