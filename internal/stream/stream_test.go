@@ -128,6 +128,23 @@ func TestStreamReasoningContent(t *testing.T) {
 	}
 }
 
+// TestStreamReasoningAliasGLM: GLM-family upstreams stream the thinking field
+// under the bare `reasoning` key (not `reasoning_content`). Regression for the
+// silent-drop bug where downstream-response.log lost all thinking content.
+func TestStreamReasoningAliasGLM(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think step 1\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if !strings.Contains(joined, `"delta":{"type":"thinking_delta","thinking":"think step 1"}`) {
+		t.Errorf("GLM reasoning alias must produce a thinking delta: %s", joined)
+	}
+	if !strings.Contains(joined, `"delta":{"type":"text_delta","text":"answer"}`) {
+		t.Errorf("text delta missing: %s", joined)
+	}
+}
+
 func TestStreamSignatureAtEnd(t *testing.T) {
 	// 纯 thinking 响应（裁决 2026-08-03 跟随 TS）。
 	// 裁决指令初版预期"收尾 close_all 时 thinking 仍开 → 含 signature_delta"，

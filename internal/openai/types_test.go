@@ -204,6 +204,40 @@ func TestChunkToolCallDelta(t *testing.T) {
 	}
 }
 
+// TestDeltaReasoningAlias: GLM-family upstreams stream the thinking field under
+// the bare name `reasoning` (not OpenAI's `reasoning_content`). Without the
+// alias the whole thinking trace is dropped. Both keys map to ReasoningContent;
+// `reasoning_content` wins on collision.
+func TestDeltaReasoningAlias(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"choices":[{"delta":{"reasoning":"think step 1"}}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Choices[0].Delta.ReasoningContent == nil || *c.Choices[0].Delta.ReasoningContent != "think step 1" {
+		t.Errorf("reasoning alias not mapped: %+v", c.Choices[0].Delta)
+	}
+}
+
+func TestDeltaReasoningContentWins(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"choices":[{"delta":{"reasoning":"bare","reasoning_content":"standard"}}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if *c.Choices[0].Delta.ReasoningContent != "standard" {
+		t.Errorf("reasoning_content should win on collision: %+v", c.Choices[0].Delta)
+	}
+}
+
+func TestDeltaReasoningEmptyIgnored(t *testing.T) {
+	var c Chunk
+	if err := decodeChunk(&c, `{"choices":[{"delta":{"reasoning":""}}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if c.Choices[0].Delta.ReasoningContent != nil {
+		t.Errorf("empty reasoning must not set ReasoningContent: %+v", c.Choices[0].Delta)
+	}
+}
+
 func decodeChunk(c *Chunk, data string) error {
 	dec := json.NewDecoder(strings.NewReader(data))
 	return dec.Decode(c)

@@ -65,6 +65,31 @@ type Error struct {
 	Code    *int64 `json:"code,omitempty"`
 }
 
+// UnmarshalJSON for Delta tolerates both `reasoning_content` (OpenAI/DeepSeek)
+// and `reasoning` (GLM-family upstreams stream the thinking field under this
+// bare name). Without this alias, the entire thinking trace is silently
+// dropped on GLM upstreams and the downstream response loses all reasoning
+// content. Both keys map to ReasoningContent; `reasoning_content` wins on
+// collision (the OpenAI-standard field).
+func (d *Delta) UnmarshalJSON(data []byte) error {
+	type alias Delta
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*d = Delta(a)
+	var raw struct {
+		Reasoning *string `json:"reasoning,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Reasoning != nil && *raw.Reasoning != "" && (d.ReasoningContent == nil || *d.ReasoningContent == "") {
+		d.ReasoningContent = raw.Reasoning
+	}
+	return nil
+}
+
 // UnmarshalJSON tolerates both numeric and string error codes: OpenAI sends
 // numbers, but OpenRouter / newapi / GLM-family upstreams emit string codes
 // like "E429". A numeric string is converted to int64; a non-numeric string
