@@ -283,6 +283,11 @@ func LoadFile(path string) (*Config, error) {
 		warn("Invalid port %d (must be between 1 and 65535); falling back to 8082", cfg.Port)
 		cfg.Port = 8082
 	}
+	// Upstreams without any route can never serve a request (no route matches,
+	// Distinct() is empty) — fail at load time rather than per request.
+	if len(cfg.Upstreams) > 0 && len(routes) == 0 {
+		return nil, fmt.Errorf(`config defines upstreams but no routes; add at least one "routes" entry`)
+	}
 	// Validate by building a Router once (instance discarded): load-time and
 	// runtime share the same validation code path.
 	if _, err := NewRouter(cfg.Upstreams, cfg.Routes); err != nil {

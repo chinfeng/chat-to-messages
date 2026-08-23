@@ -1491,6 +1491,182 @@ func TestRoundRobinDistribution(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Task 6: passthrough endpoints routed by body model / merged models.
+// ---------------------------------------------------------------------------
+
+func TestChatCompletionsRoutedByBodyModel(t *testing.T) {
+	hitA, hitB := atomic.Bool{}, atomic.Bool{}
+	var gotBodyA string
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBodyA = string(b)
+		hitA.Store(true)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitB.Store(true)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer b.Close()
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{{Name: "a", BaseURL: a.URL, APIKey: "k-a"}, {Name: "b", BaseURL: b.URL, APIKey: "k-b"}},
+		Routes: []config.Route{
+			{Pattern: "glm-*", Names: []string{"a"}},
+			{Pattern: "*", Names: []string{"b"}},
+		},
+	}
+	h := NewHandler(cfg)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// glm-4 matches glm-* → upstream a only; raw body forwarded verbatim.
+	body1 := `{"model":"glm-4","messages":[]}`
+	if rec := post(body1); rec.Code != 200 {
+		t.Fatalf("200 expected, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !hitA.Load() || hitB.Load() {
+		t.Fatalf("hits = a:%v b:%v, want a:true b:false", hitA.Load(), hitB.Load())
+	}
+	if gotBodyA != body1 {
+		t.Errorf("upstream body mismatch:\n got: %q\nwant: %q", gotBodyA, body1)
+	}
+
+	// other matches * → upstream b.
+	if rec := post(`{"model":"other","messages":[]}`); rec.Code != 200 {
+		t.Fatalf("200 expected, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !hitB.Load() {
+		t.Error("catch-all route did not reach upstream b")
+	}
+
+	// Missing model → 400 in OpenAI error format.
+	rec := post(`{"messages":[]}`)
+	if rec.Code != 400 {
+		t.Fatalf("400 expected for missing model, got %d", rec.Code)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"error"`) || !strings.Contains(out, "invalid_request_error") {
+		t.Errorf("body = %s", out)
+	}
+
+	// Non-string model is equally rejected.
+	if rec := post(`{"model":123,"messages":[]}`); rec.Code != 400 {
+		t.Errorf("400 expected for non-string model, got %d", rec.Code)
+	}
+
+	// No matching route → 400 listing configured patterns (no catch-all here).
+	h2 := NewHandler(&config.Config{
+		Upstreams: []*config.Upstream{{Name: "a", BaseURL: a.URL, APIKey: "k-a"}},
+		Routes:    []config.Route{{Pattern: "glm-*", Names: []string{"a"}}},
+	})
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"unknown-model","messages":[]}`))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	h2.ServeHTTP(rec2, req2)
+	if rec2.Code != 400 || !strings.Contains(rec2.Body.String(), "no route configured") {
+		t.Fatalf("want 400 no route, got %d %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "glm-*") {
+		t.Errorf("configured patterns missing from body: %s", rec2.Body.String())
+	}
+}
+
+func TestModelsMergedAcrossUpstreams(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"glm-4"},{"id":"shared"}]}`)
+	}))
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"deepseek-v4"},{"id":"shared"}]}`)
+	}))
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{{Name: "a", BaseURL: a.URL, APIKey: "k-a"}, {Name: "b", BaseURL: b.URL, APIKey: "k-b"}},
+		Routes: []config.Route{
+			{Pattern: "glm-*", Names: []string{"a"}},
+			{Pattern: "*", Names: []string{"b"}},
+		},
+	}
+	h := NewHandler(cfg)
+
+	getModels := func() (int, string, []string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+		var doc struct {
+			Data []struct{ Id string `json:"id"` }
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+		var ids []string
+		for _, m := range doc.Data {
+			ids = append(ids, m.Id)
+		}
+		return rec.Code, rec.Body.String(), ids
+	}
+
+	code, body, ids := getModels()
+	if code != 200 {
+		t.Fatalf("200 expected, got %d", code)
+	}
+	want := []string{"glm-4", "deepseek-v4", "shared"} // 去重,a(声明序)的 shared 优先
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("ids = %v, want %v", ids, want)
+	}
+
+	// b goes down: partial degradation still serves a's models.
+	b.Close()
+	code, body, ids = getModels()
+	if code != 200 {
+		t.Fatalf("200 expected with one upstream down, got %d %s", code, body)
+	}
+	want = []string{"glm-4", "shared"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("degraded ids = %v, want %v", ids, want)
+	}
+}
+
+func TestModelsSingleUpstreamVerbatim(t *testing.T) {
+	modelsBody := `{"object":"list","data":[{"id":"m1","custom":true}],"owned_by":"x"}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/models" {
+			t.Errorf("upstream got %s %s, want GET /models", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, modelsBody)
+	}))
+	defer up.Close()
+	// File-mode style single upstream.
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{{Name: "f1", BaseURL: up.URL, APIKey: "k-f"}},
+		Routes:    []config.Route{{Pattern: "*", Names: []string{"f1"}}},
+	}
+	h := NewHandler(cfg)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// Single upstream: response must be byte-for-byte identical to the upstream's.
+	if got := rec.Body.String(); got != modelsBody {
+		t.Errorf("verbatim mismatch:\n got: %q\nwant: %q", got, modelsBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {

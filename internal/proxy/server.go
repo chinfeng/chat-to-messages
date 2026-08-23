@@ -160,9 +160,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, r
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
 		handleMessages(w, r, cfg, rt)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-		forwardPassthrough(w, r, cfg, rt, "/chat/completions")
+		handleChatCompletions(w, r, cfg, rt)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-		forwardPassthrough(w, r, cfg, rt, "/models")
+		handleModels(w, r, cfg, rt)
 	default:
 		writeJSON(w, http.StatusNotFound, notFoundError(fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path)))
 	}
@@ -730,22 +730,27 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// forwardPassthrough relays a request to the upstream verbatim: same method,
-// same body, resolved Authorization header. The upstream response (status
-// code, Content-Type, body) is relayed unchanged. Used by POST
-// /v1/chat/completions and GET /v1/models.
+// forwardPassthrough relays a request to the first distinct upstream
+// verbatim: same method, same body, resolved Authorization header. The
+// upstream response (status code, Content-Type, body) is relayed unchanged.
+// Used by handleModels for the single-upstream verbatim compatibility path.
 func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router, upstreamPath string) {
 	if !validateAuthToken(r, cfg) {
 		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
 		return
 	}
-	// Normalize through the router so file mode (legacy fields zeroed)
-	// resolves its first distinct upstream. Task 6 splits this properly.
+	// Defensive: LoadFile rejects upstreams-without-routes, but direct-struct
+	// construction can still yield an empty Distinct list.
 	if rt == nil {
 		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", "Invalid upstream configuration."))
 		return
 	}
-	u := rt.Distinct()[0]
+	ups := rt.Distinct()
+	if len(ups) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, openAIError("api_error", "No upstream configured."))
+		return
+	}
+	u := ups[0]
 	apiKey := effectiveKey(u, clientKey(r))
 	// Same non-passthrough guard as handleMessages: never forward the
 	// downstream auth token to the upstream.
@@ -786,9 +791,14 @@ func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 		return
 	}
 	defer upstreamRes.Body.Close()
+	relayResponse(w, upstreamRes)
+}
 
-	// Relay the upstream response verbatim: status, Content-Type, body.
-	ct := upstreamRes.Header.Get("Content-Type")
+// relayResponse relays an upstream response to the client verbatim: status
+// code, Content-Type, and body (SSE keep-alive headers added for event
+// streams, CORS on everything).
+func relayResponse(w http.ResponseWriter, res *http.Response) {
+	ct := res.Header.Get("Content-Type")
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
@@ -799,10 +809,181 @@ func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 		w.Header().Set("Connection", "keep-alive")
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.WriteHeader(upstreamRes.StatusCode)
+	w.WriteHeader(res.StatusCode)
 	if flusher, ok := w.(http.Flusher); ok {
-		_, _ = io.Copy(flushWriter{w: w, f: flusher}, upstreamRes.Body)
+		_, _ = io.Copy(flushWriter{w: w, f: flusher}, res.Body)
 	} else {
-		_, _ = io.Copy(w, upstreamRes.Body)
+		_, _ = io.Copy(w, res.Body)
 	}
+}
+
+// handleChatCompletions handles POST /v1/chat/completions: the request is
+// relayed byte-for-byte to the upstream selected by the body's model field,
+// with pre-stream failover across the resolved candidate chain. No dump —
+// passthrough traffic bypasses session recording.
+func handleChatCompletions(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router) {
+	if !validateAuthToken(r, cfg) {
+		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
+		return
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error", "Invalid request body."))
+		return
+	}
+	// Lightweight peek: model must be present and a JSON string. A non-string
+	// value fails Unmarshal; missing/empty fails the emptiness check. The raw
+	// body itself is forwarded untouched.
+	var peek struct {
+		Model string
+	}
+	if err := json.Unmarshal(raw, &peek); err != nil || peek.Model == "" {
+		writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error", "`model` is required in request body."))
+		return
+	}
+	if rt == nil {
+		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", "Invalid upstream configuration."))
+		return
+	}
+	candidates := rt.Resolve(peek.Model)
+	if candidates == nil {
+		writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error",
+			fmt.Sprintf("no route configured for model %q (configured patterns: %s)", peek.Model, strings.Join(rt.Patterns(), ", "))))
+		return
+	}
+	mkReq := func(u *config.Upstream, apiKey string) (*http.Request, error) {
+		// Non-passthrough parity: a keyless candidate must never receive the
+		// downstream auth token.
+		if u.APIKey == "" && cfg.AuthToken != "" {
+			return nil, errNoAPIKey
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+			strings.TrimRight(u.BaseURL, "/")+"/chat/completions", bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		ct := r.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		return req, nil
+	}
+	res, err := postWithFailover(r.Context(), candidates, clientKey(r), mkReq, dump.NewSession(""))
+	if errors.Is(err, errNoAPIKey) {
+		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, openAIError("api_error", "Upstream error: "+err.Error()))
+		return
+	}
+	defer res.Body.Close()
+	relayResponse(w, res)
+}
+
+// handleModels handles GET /v1/models. With exactly one distinct upstream the
+// response is relayed verbatim (byte-for-byte compatibility). With several,
+// each upstream's /models is fetched concurrently and entries are merged,
+// deduped by model id with declaration-order preference; individual upstream
+// failures degrade gracefully and only a total failure surfaces as 502.
+func handleModels(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router) {
+	if !validateAuthToken(r, cfg) {
+		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
+		return
+	}
+	if rt == nil {
+		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", "Invalid upstream configuration."))
+		return
+	}
+	ups := rt.Distinct()
+	if len(ups) == 1 { // single-upstream verbatim compatibility path
+		forwardPassthrough(w, r, cfg, rt, "/models")
+		return
+	}
+	if len(ups) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, openAIError("api_error", "No upstream configured."))
+		return
+	}
+
+	type result struct {
+		data []map[string]any
+		ok   bool
+	}
+	results := make([]result, len(ups)) // distinct indices → race-free writes
+	ck := clientKey(r)
+	var wg sync.WaitGroup
+	for i, u := range ups {
+		wg.Add(1)
+		go func(i int, u *config.Upstream) {
+			defer wg.Done()
+			key := effectiveKey(u, ck)
+			if key == "" || (u.APIKey == "" && cfg.AuthToken != "") {
+				return // non-passthrough: never forward the downstream token
+			}
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+				strings.TrimRight(u.BaseURL, "/")+"/models", nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+key)
+			res, err := (&http.Client{}).Do(req)
+			if err != nil {
+				return
+			}
+			defer res.Body.Close()
+			if res.StatusCode < 200 || res.StatusCode >= 300 {
+				return
+			}
+			var doc struct {
+				Data []map[string]any
+			}
+			if json.NewDecoder(res.Body).Decode(&doc) != nil {
+				return
+			}
+			results[i] = result{data: doc.Data, ok: true}
+		}(i, u)
+	}
+	wg.Wait()
+
+	// Merge positionally across upstreams in declaration order: entry j of
+	// every upstream is considered before entry j+1, so earlier-declared
+	// upstreams win both id collisions and list positions.
+	seen := make(map[string]bool)
+	var merged []map[string]any
+	anyOK := false
+	for _, res := range results {
+		if res.ok {
+			anyOK = true // an OK-but-empty list is still success, not total failure
+			break
+		}
+	}
+	for j := 0; ; j++ {
+		progressed := false
+		for _, res := range results {
+			if !res.ok || j >= len(res.data) {
+				continue
+			}
+			progressed = true
+			m := res.data[j]
+			id, _ := m["id"].(string)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			merged = append(merged, m)
+		}
+		if !progressed {
+			break
+		}
+	}
+	if !anyOK {
+		writeJSON(w, http.StatusBadGateway, openAIError("api_error", "Upstream error: all upstreams failed for /v1/models"))
+		return
+	}
+	if merged == nil {
+		merged = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": merged})
 }
