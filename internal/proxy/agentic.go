@@ -300,12 +300,16 @@ func handleAgenticLoopErrorStatus(w http.ResponseWriter, session *dump.Session, 
 
 // handleServerToolRequest runs the agentic loop for requests that contain
 // server tools (port of handleServerToolRequest() in routes.ts).
-func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, apiKey string, inputTokens int64) {
+func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, candidates []*config.Upstream, clientKey string, inputTokens int64) {
 	onLog := session.LogServerTool
+
+	// Single-candidate semantics; Task 7 adds failover across the chain.
+	u := candidates[0]
+	apiKey := effectiveKey(u, clientKey)
 
 	// Build the initial upstream request body (the full body — Claude Code
 	// puts server tools in the tools array, so the schemas ride along).
-	upstreamURL, initialBody, err := buildUpstreamRequestBodyOnly(cfg, requestData)
+	upstreamURL, initialBody, err := buildUpstreamRequestBodyOnly(u, requestData)
 	if err != nil {
 		session.Finish()
 		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))

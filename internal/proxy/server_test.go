@@ -1275,6 +1275,70 @@ func TestModelsPassthroughMissingKey401(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Multi-upstream routing: /v1/messages through the candidate chain.
+// ---------------------------------------------------------------------------
+
+func TestNoRouteForModel(t *testing.T) {
+	var upstreamHit bool
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{{Name: "a", BaseURL: up.URL}},
+		Routes:    []config.Route{{Pattern: "glm-*", Names: []string{"a"}}},
+	}
+	h := NewHandler(cfg)
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"deepseek-v4","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "no route configured") {
+		t.Fatalf("want 400 no route, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "glm-*") {
+		t.Errorf("configured patterns missing from body: %s", rec.Body.String())
+	}
+	if upstreamHit {
+		t.Error("upstream must not be reached when no route matches")
+	}
+}
+
+func TestRoutedToConfiguredUpstream(t *testing.T) {
+	var hitModel, gotAuth string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		hitModel, _ = b["model"].(string)
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, typicalUpstreamSSE())
+	}))
+	defer up.Close()
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{{Name: "z1", BaseURL: up.URL, APIKey: "k-z"}},
+		Routes:    []config.Route{{Pattern: "*", Names: []string{"z1"}}},
+	}
+	h := NewHandler(cfg)
+	resp := postMessages(t, h, `{"model":"glm-4.7","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "client-key"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("200 expected, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !contains(eventTypes(parseSSE(t, string(body))), "message_stop") {
+		t.Errorf("message_stop missing: %s", body)
+	}
+	if hitModel != "glm-4.7" {
+		t.Errorf("upstream model = %q, want glm-4.7", hitModel)
+	}
+	// effectiveKey: the upstream's own key wins over the client key.
+	if !strings.Contains(gotAuth, "k-z") {
+		t.Errorf("upstream key not used: %q", gotAuth)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {

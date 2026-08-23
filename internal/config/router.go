@@ -110,6 +110,34 @@ func (rt *Router) Distinct() []*Upstream {
 	return out
 }
 
+// Router normalizes both config modes into a *Router. Called per request so
+// tests may mutate the shared cfg pointer between requests. File mode
+// (--config) builds through NewRouter (nil on invalid data — LoadFile already
+// validated, so this is defensive); legacy CLI / direct-struct construction
+// synthesizes a single catch-all upstream from the legacy fields.
+func (c *Config) Router() *Router {
+	if len(c.Upstreams) > 0 {
+		rt, err := NewRouter(c.Upstreams, c.Routes)
+		if err != nil {
+			return nil // LoadFile 已校验过;防御性兜底
+		}
+		return rt
+	}
+	return MustSyntheticRouter(&Upstream{
+		Name:           "default",
+		BaseURL:        c.UpstreamBaseURL,
+		APIKey:         c.UpstreamAPIKey,
+		ModelOverrides: c.ModelOverrides,
+	})
+}
+
+// MustSyntheticRouter builds a single-upstream catch-all router without
+// validation (legacy CLI / direct-struct construction path).
+func MustSyntheticRouter(u *Upstream) *Router {
+	r := &Route{Pattern: "*", Names: []string{u.Name}, pool: []*Upstream{u}}
+	return &Router{routes: []*Route{r}}
+}
+
 // Describe renders banner lines: "glm-* -> [zai-1 zai-2]".
 func (rt *Router) Describe() []string {
 	out := make([]string, 0, len(rt.routes))

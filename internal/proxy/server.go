@@ -180,12 +180,6 @@ func stripBearer(auth string) string {
 	return auth
 }
 
-// isPassthroughMode mirrors isPassthroughMode(): no upstream key and no
-// downstream auth token.
-func isPassthroughMode(cfg *config.Config) bool {
-	return cfg.UpstreamAPIKey == "" && cfg.AuthToken == ""
-}
-
 // validateAuthToken mirrors validateAuthToken(): passes when no token is
 // configured; otherwise the client key must equal the configured token.
 func validateAuthToken(r *http.Request, cfg *config.Config) bool {
@@ -195,14 +189,16 @@ func validateAuthToken(r *http.Request, cfg *config.Config) bool {
 	return clientKey(r) == cfg.AuthToken
 }
 
-// resolveAPIKey mirrors resolveApiKey(): in passthrough mode the client key
-// is forwarded; otherwise the configured upstream key is used.
-func resolveAPIKey(r *http.Request, cfg *config.Config) string {
-	key := clientKey(r)
-	if isPassthroughMode(cfg) && key != "" {
-		return key
+// effectiveKey resolves the key for one candidate: its own key wins;
+// empty → forward the client's key (per-upstream passthrough). Callers must
+// additionally refuse to forward when a downstream auth token is configured
+// (non-passthrough legacy semantics — the downstream token never leaks to the
+// upstream).
+func effectiveKey(u *config.Upstream, clientKey string) string {
+	if u.APIKey != "" {
+		return u.APIKey
 	}
-	return cfg.UpstreamAPIKey
+	return clientKey
 }
 
 // hasServerToolRequest reports whether the request contains any server tool
@@ -243,14 +239,14 @@ func applyIncludeUsage(body map[string]any) {
 // buildUpstreamRequest and buildUpstreamRequestBodyOnly (port of the body
 // steps of buildUpstreamRequest() in routes.ts): base body, stream: true,
 // model extra merged, include_usage applied, canonicalized.
-func buildBaseBody(cfg *config.Config, requestData *convert.RequestData) (map[string]any, error) {
+func buildBaseBody(u *config.Upstream, requestData *convert.RequestData) (map[string]any, error) {
 	body, err := convert.BuildBaseRequestBody(requestData, 4096, convert.ReplayThinkTags)
 	if err != nil {
 		return nil, err
 	}
 	body["stream"] = true
 
-	extra := config.ResolveModelExtra(requestData.Model, cfg.ModelOverrides)
+	extra := config.ResolveModelExtra(requestData.Model, u.ModelOverrides)
 	if len(extra) > 0 {
 		body = config.DeepMerge(body, extra)
 	}
@@ -262,12 +258,12 @@ func buildBaseBody(cfg *config.Config, requestData *convert.RequestData) (map[st
 // the OpenAI-compatible request body (stream: true, model extra merged,
 // include_usage applied, canonicalized) and the /chat/completions URL.
 // Returns the wire body and the pretty-printed body for the dump.
-func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, apiKey string) (url string, wire []byte, pretty []byte, err error) {
-	body, err := buildBaseBody(cfg, requestData)
+func buildUpstreamRequest(u *config.Upstream, requestData *convert.RequestData, apiKey string) (url string, wire []byte, pretty []byte, err error) {
+	body, err := buildBaseBody(u, requestData)
 	if err != nil {
 		return "", nil, nil, err
 	}
-	url = strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions"
+	url = strings.TrimRight(u.BaseURL, "/") + "/chat/completions"
 
 	wire, err = json.Marshal(body)
 	if err != nil {
@@ -285,8 +281,8 @@ func buildUpstreamRequest(cfg *config.Config, requestData *convert.RequestData, 
 // routes.ts: the same body as buildUpstreamRequest (full body including the
 // server tool function schemas — Claude Code puts server tools in the tools
 // array), compact JSON for the wire.
-func buildUpstreamRequestBodyOnly(cfg *config.Config, requestData *convert.RequestData) (url string, wire []byte, err error) {
-	body, err := buildBaseBody(cfg, requestData)
+func buildUpstreamRequestBodyOnly(u *config.Upstream, requestData *convert.RequestData) (url string, wire []byte, err error) {
+	body, err := buildBaseBody(u, requestData)
 	if err != nil {
 		return "", nil, err
 	}
@@ -294,7 +290,7 @@ func buildUpstreamRequestBodyOnly(cfg *config.Config, requestData *convert.Reque
 	if err != nil {
 		return "", nil, err
 	}
-	return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions", wire, nil
+	return strings.TrimRight(u.BaseURL, "/") + "/chat/completions", wire, nil
 }
 
 // handleMessages handles POST /v1/messages (port of handleMessages() in
@@ -311,12 +307,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
-	apiKey := resolveAPIKey(r, cfg)
-	if apiKey == "" {
-		session.Finish()
-		writeJSON(w, http.StatusUnauthorized, authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
-		return
-	}
+	clientKey := clientKey(r)
 
 	// Parse the Anthropic /v1/messages body (UseNumber fidelity).
 	rawBody, err := io.ReadAll(r.Body)
@@ -363,6 +354,30 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
+	// --- Routing: resolve the model to an ordered candidate chain ---
+	rt := cfg.Router()
+	if rt == nil {
+		session.Finish()
+		writeJSON(w, http.StatusInternalServerError, serverError("Invalid upstream configuration."))
+		return
+	}
+	candidates := rt.Resolve(req.Model)
+	if candidates == nil {
+		session.Finish()
+		writeJSON(w, http.StatusBadRequest, invalidRequestError(fmt.Sprintf("no route configured for model %q (configured patterns: %s)", req.Model, strings.Join(rt.Patterns(), ", "))))
+		return
+	}
+	upstream := candidates[0] // single-candidate semantics; Task 5 adds failover
+	apiKey := effectiveKey(upstream, clientKey)
+	// Legacy non-passthrough parity: when the selected upstream has no key of
+	// its own, the client key may be forwarded only in true passthrough mode
+	// (no downstream auth token) — never leak the downstream token upstream.
+	if apiKey == "" || (upstream.APIKey == "" && cfg.AuthToken != "") {
+		session.Finish()
+		writeJSON(w, http.StatusUnauthorized, authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+		return
+	}
+
 	requestData := &convert.RequestData{
 		Model:         req.Model,
 		Messages:      req.Messages,
@@ -381,12 +396,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	// intercepted and handled by the agentic loop in agentic.go (web_search /
 	// web_fetch executed proxy-side, results injected, final text streamed). ---
 	if (cfg.ServerTools.WebSearch || cfg.ServerTools.WebFetch) && hasServerToolRequest(&req) {
-		handleServerToolRequest(w, r, cfg, session, requestStart, requestData, apiKey, inputTokens)
+		handleServerToolRequest(w, r, cfg, session, requestStart, requestData, candidates, clientKey, inputTokens)
 		return
 	}
 
 	// --- Standard streaming flow (no server tools) ---
-	url, wireBody, prettyBody, err := buildUpstreamRequest(cfg, requestData, apiKey)
+	url, wireBody, prettyBody, err := buildUpstreamRequest(upstream, requestData, apiKey)
 	if err != nil {
 		session.Finish()
 		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
@@ -643,8 +658,18 @@ func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
 		return
 	}
-	apiKey := resolveAPIKey(r, cfg)
-	if apiKey == "" {
+	// Normalize through the router so file mode (legacy fields zeroed)
+	// resolves its first distinct upstream. Task 6 splits this properly.
+	rt := cfg.Router()
+	if rt == nil {
+		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", "Invalid upstream configuration."))
+		return
+	}
+	u := rt.Distinct()[0]
+	apiKey := effectiveKey(u, clientKey(r))
+	// Same non-passthrough guard as handleMessages: never forward the
+	// downstream auth token to the upstream.
+	if apiKey == "" || (u.APIKey == "" && cfg.AuthToken != "") {
 		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
 		return
 	}
@@ -659,7 +684,7 @@ func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Conf
 		body = bytes.NewReader(raw)
 	}
 
-	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + upstreamPath
+	url := strings.TrimRight(u.BaseURL, "/") + upstreamPath
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, url, body)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", err.Error()))
