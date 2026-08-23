@@ -110,8 +110,10 @@ func (rt *Router) Distinct() []*Upstream {
 	return out
 }
 
-// Router normalizes both config modes into a *Router. Called per request so
-// tests may mutate the shared cfg pointer between requests. File mode
+// Router normalizes both config modes into a *Router. It is called ONCE at
+// handler construction (proxy.NewHandler) and the returned *Router must be
+// cached by the caller: Route round-robin counters are stateful, so
+// reconstructing the Router per request would reset the rotation. File mode
 // (--config) builds through NewRouter (nil on invalid data — LoadFile already
 // validated, so this is defensive); legacy CLI / direct-struct construction
 // synthesizes a single catch-all upstream from the legacy fields.

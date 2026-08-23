@@ -288,6 +288,12 @@ func LoadFile(path string) (*Config, error) {
 	if len(cfg.Upstreams) > 0 && len(routes) == 0 {
 		return nil, fmt.Errorf(`config defines upstreams but no routes; add at least one "routes" entry`)
 	}
+	// Zero upstreams boots a healthy-looking server that 502s every request.
+	// Also catches a typo'd top-level key ("upstream"): JSON decoding silently
+	// leaves Upstreams nil, so say explicitly that "upstreams" is required.
+	if len(cfg.Upstreams) == 0 {
+		return nil, fmt.Errorf("config defines no upstreams; \"upstreams\" is required (check your config keys)")
+	}
 	// Validate by building a Router once (instance discarded): load-time and
 	// runtime share the same validation code path.
 	if _, err := NewRouter(cfg.Upstreams, cfg.Routes); err != nil {

@@ -455,6 +455,10 @@ func TestLoadFileValidationErrors(t *testing.T) {
 		// Upstreams without any route can never serve a request (Distinct()
 		// would be empty) — rejected at load time instead of failing per request.
 		`{"upstreams":[{"name":"a","baseUrl":"http://x"}],"routes":[]}`: "no routes",
+		// Empty file / typo'd top-level key ("upstream") decodes to zero
+		// upstreams — rejected at load time instead of booting a server that
+		// 502s every request.
+		`{}`: "no upstreams",
 	}
 	for body, want := range cases {
 		if _, err := LoadFile(writeTempConfig(t, body)); err == nil || !strings.Contains(err.Error(), want) {
@@ -464,7 +468,9 @@ func TestLoadFileValidationErrors(t *testing.T) {
 }
 
 func TestLoadMutualExclusion(t *testing.T) {
-	path := writeTempConfig(t, `{}`)
+	// Minimal valid file: LoadFile rejects zero-upstream configs, so an
+	// empty body would fail the lone --config case below for the wrong reason.
+	path := writeTempConfig(t, `{"upstreams":[{"name":"a","baseUrl":"http://x/v1"}],"routes":[{"pattern":"*","upstreams":["a"]}]}`)
 	if _, err := Load([]string{"--config", path, "--port", "9999"}); err == nil {
 		t.Fatal("--config plus another flag must error")
 	}
