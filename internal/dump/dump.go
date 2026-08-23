@@ -64,16 +64,17 @@ type timing struct {
 // operations fail silently (TS `catch {}`). Like the TS original, it assumes
 // single-request-single-goroutine use and is not mutex-protected.
 type Session struct {
-	noop      bool // dir == "" → every method is a no-op
-	dir       string
-	id        string
-	tmpDir    string
-	startTime time.Time
-	finished  bool
-	tracked   TerminationReason
-	upstream  *Termination
-	timing    *timing
-	toolLogs  []string
+	noop        bool // dir == "" → every method is a no-op
+	dir         string
+	id          string
+	tmpDir      string
+	startTime   time.Time
+	finished    bool
+	tracked     TerminationReason
+	upstream    *Termination
+	timing      *timing
+	toolLogs    []string
+	attemptLogs []string
 }
 
 // NewSession creates a dump session. A session writes to
@@ -148,6 +149,21 @@ func (s *Session) LogServerTool(entry ServerToolLogEntry) {
 	s.toolLogs = append(s.toolLogs, formatServerToolEntry(entry))
 }
 
+// LogUpstreamAttempt records one upstream attempt (failover trail), written to
+// upstream-attempts.log on Finish. status == 0 (no HTTP response) renders "-".
+func (s *Session) LogUpstreamAttempt(name, url string, status int, outcome string) {
+	if s.noop {
+		return
+	}
+	statusStr := strconv.Itoa(status)
+	if status == 0 {
+		statusStr = "-"
+	}
+	s.attemptLogs = append(s.attemptLogs,
+		fmt.Sprintf("[%s] %s (%s)\nStatus: %s\nOutcome: %s\n---\n",
+			time.Now().UTC().Format(time.RFC3339), name, url, statusStr, outcome))
+}
+
 // RecordUpstreamTermination records the TRUE upstream outcome, reported by
 // the stream layer (e.g. an upstream abort the stream layer swallowed to
 // complete the downstream turn gracefully). No-op once the session has
@@ -165,8 +181,9 @@ func (s *Session) UpstreamTermination() *Termination {
 	return s.upstream
 }
 
-// Finish closes the session: writes server-tools.log if any tool entries were
-// collected, then renames the in-progress directory into the classification
+// Finish closes the session: writes server-tools.log (if any tool entries
+// were collected) and upstream-attempts.log (if any upstream attempts were
+// recorded), then renames the in-progress directory into the classification
 // bucket. The bucket reflects the ROOT CAUSE, which can differ from the
 // tracked downstream outcome (see pickTerminationReason). Idempotent.
 func (s *Session) Finish() {
@@ -176,6 +193,9 @@ func (s *Session) Finish() {
 	s.finished = true
 	if len(s.toolLogs) > 0 {
 		_ = os.WriteFile(filepath.Join(s.tmpDir, "server-tools.log"), []byte(strings.Join(s.toolLogs, "\n")), 0o644)
+	}
+	if len(s.attemptLogs) > 0 {
+		_ = os.WriteFile(filepath.Join(s.tmpDir, "upstream-attempts.log"), []byte(strings.Join(s.attemptLogs, "\n")), 0o644)
 	}
 	endTime := time.Now()
 	finalName := s.id + "__START_" + formatTime(s.startTime) + "__END_" + formatTime(endTime)

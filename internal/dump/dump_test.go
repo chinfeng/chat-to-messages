@@ -111,6 +111,25 @@ func TestRecordAfterFinishIsNoop(t *testing.T) {
 	}
 }
 
+func TestLogUpstreamAttemptWrittenOnFinish(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSession(dir)
+	s.LogUpstreamAttempt("zai-1", "https://z/v1/chat/completions", 429, "skipped: retryable status")
+	s.LogUpstreamAttempt("zai-2", "https://y/v1/chat/completions", 200, "served")
+	s.Finish()
+	// 找到 bucket 目录里的 attempts 文件并断言内容包含两条记录。
+	matches, _ := filepath.Glob(filepath.Join(dir, "*", "*__START_*", "upstream-attempts.log"))
+	if len(matches) != 1 {
+		t.Fatalf("attempts log missing: %v", matches)
+	}
+	data, _ := os.ReadFile(matches[0])
+	text := string(data)
+	if !strings.Contains(text, "zai-1") || !strings.Contains(text, "429") ||
+		!strings.Contains(text, "skipped") || !strings.Contains(text, "zai-2") {
+		t.Fatalf("unexpected attempts log:\n%s", text)
+	}
+}
+
 func TestServerToolLog(t *testing.T) {
 	dir := t.TempDir()
 	s := NewSession(dir)
