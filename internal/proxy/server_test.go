@@ -619,7 +619,7 @@ func TestUpstreamAbortSurfacesStreamError(t *testing.T) {
 	if errObj == nil || errObj["type"] != "overloaded_error" {
 		t.Errorf("error.type = %v", errObj)
 	}
-		msg, _ := errObj["message"].(string)
+	msg, _ := errObj["message"].(string)
 	if !strings.Contains(msg, "Connection closed mid-response. The response above may be incomplete") {
 		t.Errorf("message = %q", msg)
 	}
@@ -1605,7 +1605,9 @@ func TestModelsMergedAcrossUpstreams(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 		var doc struct {
-			Data []struct{ Id string `json:"id"` }
+			Data []struct {
+				Id string `json:"id"`
+			}
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &doc)
 		var ids []string

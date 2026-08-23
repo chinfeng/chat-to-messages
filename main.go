@@ -29,8 +29,20 @@ func main() {
 	// 启动横幅（与 TS 版格式一致，名称改为 chat-to-messages）
 	passthrough := cfg.UpstreamAPIKey == "" && cfg.AuthToken == ""
 	fmt.Printf("chat-to-messages listening on http://localhost:%d\n", cfg.Port)
-	fmt.Printf("  Upstream: %s\n", cfg.UpstreamBaseURL)
-	fmt.Printf("  Upstream API key: %s\n", boolWord(cfg.UpstreamAPIKey != ""))
+	if len(cfg.Upstreams) > 0 {
+		fmt.Printf("  Upstreams:\n")
+		for _, u := range cfg.Upstreams {
+			fmt.Printf("    %s -> %s (key: %s)\n", u.Name, u.BaseURL, boolWord(u.APIKey != ""))
+		}
+		fmt.Printf("  Routes:\n")
+		rt := cfg.Router()
+		for _, line := range rt.Describe() {
+			fmt.Printf("    %s\n", line)
+		}
+	} else {
+		fmt.Printf("  Upstream: %s\n", cfg.UpstreamBaseURL)
+		fmt.Printf("  Upstream API key: %s\n", boolWord(cfg.UpstreamAPIKey != ""))
+	}
 	fmt.Printf("  Auth token: %s\n", boolWord(cfg.AuthToken != ""))
 	fmt.Printf("  Passthrough mode: %v\n", passthrough)
 	fmt.Printf("  Thinking: %v\n", cfg.EnableThinking)

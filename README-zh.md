@@ -6,7 +6,7 @@
 
 ## 设计哲学
 
-本项目遵循 Unix 哲学：**一个进程只对接一个上游端点**。若需同时使用多个上游（如不同模型或 provider），请启动多个进程，各自监听不同端口，由客户端或负载均衡器做路由选择。这样做的好处是：
+本项目遵循 Unix 哲学：默认形态仍是**一个进程只对接一个上游端点**——传入 `--upstream-base-url` 即可得到纯粹的单上游 OpenAI→Anthropic 协议中转，无任何路由状态。若需多个上游，既可以按传统方式跑多个进程、各自监听不同端口（由客户端或负载均衡器做路由），也可以通过 `--config` 在单进程内配置**多上游路由**：按模型分组轮询 + 流前故障转移（见[多上游路由](#多上游路由)与[设计 spec](docs/superpowers/specs/2026-08-23-multi-upstream-routing-design.md)）。单进程单上游的好处：
 
 - 每个进程简单、可预测、易调试
 - 无内置路由状态，进程无状态，随起随停
@@ -17,7 +17,7 @@
 受 [free-claude-code](https://github.com/Alishahryar1/free-claude-code) 启发，本项目旨在提供一个**更轻量的部署方案**：
 
 - **更小占用** — 纯 Go 标准库，零外部依赖，编译为单个静态二进制，磁盘和内存占用远低于 Python + FastAPI 方案
-- **简化路由** — 完全去掉多上游转发，仅保留单上游的 OpenAI→Anthropic 协议中转
+- **简化路由** — 单上游 OpenAI→Anthropic 协议中转仍是默认形态；需要时可通过 `--config` 启用多上游路由（见下文）
 - **透传友好** — 支持 auth token 透传，无需硬编码上游密钥，适合部署在极轻量服务器（如 1C1G）上
 - **多进程扩展** — 需要多个上游时，只需每个上游启动一个进程，监听不同端口，由反向代理或 DNS 做路由分发
 
@@ -129,6 +129,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `--config` | `""` | JSON 配置文件路径，定义命名上游与模型路由；与其他所有参数互斥——见[多上游路由](#多上游路由) |
 | `--upstream-base-url` | `https://api.openai.com/v1` | 上游 OpenAI Chat Completions 兼容端点 |
 | `--upstream-api-key` | `""` | 上游 API Key；用于请求上游端点时的鉴权 |
 | `--auth-token` | `""` | 下游鉴权 Token；设置后客户端需在 x-api-key 头部提供匹配的值 |
@@ -275,6 +276,63 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 
 设置 `--auth-token` 后，客户端请求必须携带匹配的 `x-api-key` 或 `Authorization: Bearer xxx` 头部，否则返回 401。此功能用于保护代理不被未授权的客户端调用。
 
+### 多上游路由
+
+传入 `--config <file>` 可让单个代理进程对接多个命名上游。请求按模型名路由：每条路由将一个 glob 模式映射到一组有序的上游池，池内轮询分发请求。
+
+```json
+{
+  "port": 8082,
+  "authToken": "",
+  "enableThinking": true,
+  "dumpDir": "",
+  "upstreams": [
+    {
+      "name": "zai-1",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "apiKey": "xxx",
+      "modelOverrides": [
+        { "pattern": "glm-4.7", "extra": { "thinking": { "type": "enabled" } } }
+      ]
+    },
+    { "name": "zai-2", "baseUrl": "https://api.z.ai/api/paas/v4", "apiKey": "yyy" }
+  ],
+  "routes": [
+    { "pattern": "glm-*",      "upstreams": ["zai-1", "zai-2"] },
+    { "pattern": "deepseek-*", "upstreams": ["nim"] },
+    { "pattern": "*",          "upstreams": ["nim"] }
+  ],
+  "serverTools": {
+    "webSearch": false,
+    "webFetch": false,
+    "webSearchEngine": "brave",
+    "webSearchAPIKey": "",
+    "webSearchBaseURL": "https://api.search.brave.com",
+    "webFetchAllowedDomains": [],
+    "webFetchBlockedDomains": [],
+    "webFetchMaxContentTokens": 5000
+  }
+}
+```
+
+- **`upstreams[]`** — 命名上游。`name` 必须唯一；`baseUrl` 必填；`apiKey` 可空（为空时该上游走透传模式，客户端 key 原样转发给它）。文件模式下使用各上游私有的 `modelOverrides` 替代全局 extra params（glob 匹配 + deep-merge，语义与 `--upstream-extra-params` 一致）。
+- **`routes[]`** — 按声明序匹配，首个 glob 命中生效；引用的上游名称列表即轮询池。
+- 顶层字段（`port`、`authToken`、`enableThinking`、`dumpDir`、`serverTools`）与对应 CLI 配置语义一致。
+- `--config` 不能与其他任何 CLI 参数同时使用。配置非法（上游重名、引用不存在的上游、空池）时启动即失败并明确报错。
+
+故障转移语义 — 候选链按序尝试，全部发生在**向客户端写出第一个字节之前**：
+
+| 上游表现 | 行为 |
+|---|---|
+| 连接失败 / 超时 | 试下一个候选 |
+| HTTP 429 | 试下一个候选 |
+| HTTP 5xx | 试下一个候选 |
+| 其他 4xx | 立即返回，不转移 |
+| 全部候选失败 | 返回最后一个错误 |
+| 流开始后中断 | 不变：`event:error`，不转移 |
+
+路由下的端点行为：`/v1/messages` 解析路由后经候选链流式转发（agentic loop 每次循环复用同一个带转移的辅助函数）；`/v1/chat/completions` 按请求体 `model` 路由；`/v1/models` 并发查询所有去重上游，合并结果按 id 去重。
+
 ### 请求转储
 
 启用 `--dump <dir>` 后，每个下游请求都会被记录。会话先写入 `<dir>/in-progress/<id>/`（`<id>` 为 UUID），结束时按**根因**重命名到分类桶：
@@ -374,8 +432,8 @@ docker run -p 8082:8082 chat-to-messages \
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | `/v1/messages` | POST | Anthropic Messages API 代理（核心端点） |
-| `/v1/chat/completions` | POST | OpenAI Chat Completions 透传（原样转发，不转换） |
-| `/v1/models` | GET | OpenAI Models 透传（原样转发） |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 透传（原样转发，不转换；配置多上游时按请求体 `model` 路由） |
+| `/v1/models` | GET | OpenAI Models 透传（配置多上游时合并所有上游结果） |
 | `/health` | GET | 健康检查 |
 
 未匹配路径返回 `404` + Anthropic 格式错误体。
@@ -534,8 +592,8 @@ go build -o chat-to-messages .
 |------|-----------|-------------|
 | 运行时 | Python 3.14 + FastAPI | Go（单个静态二进制） |
 | 外部依赖 | FastAPI, Pydantic, httpx, tiktoken 等 | 零（仅标准库） |
-| Provider 数量 | 11（NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI） | 1（通用 OpenAI 兼容端点） |
-| Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 无（单一 upstream） |
+| Provider 数量 | 11（NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI） | 通用 OpenAI 兼容端点（默认单上游，`--config` 可配多个） |
+| Model Router | Opus/Sonnet/Haiku 多 provider 路由 | `--config` 按模型多上游路由 |
 | 配置方式 | 环境变量 | CLI 启动参数 |
 | 下游鉴权 | 无 | AUTH_TOKEN 验证 |
 | 可执行文件 | 无 | `go build` 单二进制 |

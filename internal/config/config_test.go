@@ -450,7 +450,7 @@ func TestLoadFileFullSchema(t *testing.T) {
 
 func TestLoadFileValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		`{"upstreams":[{"name":"a","baseUrl":""}],"routes":[{"pattern":"*","upstreams":["a"]}]}`:   "baseUrl",
+		`{"upstreams":[{"name":"a","baseUrl":""}],"routes":[{"pattern":"*","upstreams":["a"]}]}`:         "baseUrl",
 		`{"upstreams":[{"name":"a","baseUrl":"http://x"}],"routes":[{"pattern":"*","upstreams":["b"]}]}`: "unknown upstream",
 		// Upstreams without any route can never serve a request (Distinct()
 		// would be empty) — rejected at load time instead of failing per request.

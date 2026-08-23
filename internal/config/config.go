@@ -239,12 +239,12 @@ func LoadFile(path string) (*Config, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc struct {
-		Port           int             `json:"port"`
-		AuthToken      string          `json:"authToken"`
-		EnableThinking *bool           `json:"enableThinking"`
-		DumpDir        string          `json:"dumpDir"`
-		Upstreams      []*Upstream     `json:"upstreams"`
-		Routes         []struct { // wire form: JSON key "upstreams" maps to Route.Names
+		Port           int         `json:"port"`
+		AuthToken      string      `json:"authToken"`
+		EnableThinking *bool       `json:"enableThinking"`
+		DumpDir        string      `json:"dumpDir"`
+		Upstreams      []*Upstream `json:"upstreams"`
+		Routes         []struct {  // wire form: JSON key "upstreams" maps to Route.Names
 			Pattern   string   `json:"pattern"`
 			Upstreams []string `json:"upstreams"`
 		} `json:"routes"`

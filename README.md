@@ -6,7 +6,7 @@ Convert any OpenAI Chat Completions compatible endpoint to the Anthropic Message
 
 ## Design Philosophy
 
-This project follows the Unix philosophy: **one process, one upstream endpoint**. If you need multiple upstreams (e.g. different models or providers), run multiple processes on different ports and let the client or a load balancer handle routing. Benefits:
+This project follows the Unix philosophy: **one process, one upstream endpoint** remains the default shape — pass `--upstream-base-url` and the proxy does pure single-upstream OpenAI-to-Anthropic protocol translation with no routing state. If you need multiple upstreams you can either run multiple processes on different ports (letting the client or a load balancer handle routing), or — since multi-upstream routing landed — configure them inside a single process with `--config` for per-model round-robin and pre-stream failover (see [Multi-Upstream Routing](#multi-upstream-routing) and the [design spec](docs/superpowers/specs/2026-08-23-multi-upstream-routing-design.md)). Benefits of the single-process-per-upstream default:
 
 - Each process is simple, predictable, and easy to debug
 - No built-in routing state — processes are stateless, start and stop at will
@@ -17,7 +17,7 @@ This project follows the Unix philosophy: **one process, one upstream endpoint**
 Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), this project was created to provide a **lighter-weight alternative** for deployment:
 
 - **Smaller footprint** — Pure Go standard library with zero external dependencies, compiling to a single static binary with far less disk and memory usage than a Python + FastAPI stack
-- **Simplified routing** — Multi-upstream forwarding is removed entirely; only single-upstream OpenAI-to-Anthropic protocol translation remains
+- **Simplified routing** — Single-upstream OpenAI-to-Anthropic protocol translation remains the default; multi-upstream routing is opt-in via `--config` (see below)
 - **Passthrough-friendly** — Auth token passthrough allows deploying on minimal servers (e.g. 1 vCPU / 1 GB RAM) without hardcoding upstream keys
 - **Multi-process scaling** — When multiple upstreams are needed, simply run one process per upstream on different ports, and let a reverse proxy or DNS route traffic
 
@@ -129,6 +129,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--config` | `""` | Path to a JSON config file defining named upstreams and model routes; mutually exclusive with all other arguments — see [Multi-Upstream Routing](#multi-upstream-routing) |
 | `--upstream-base-url` | `https://api.openai.com/v1` | Upstream OpenAI Chat Completions compatible endpoint |
 | `--upstream-api-key` | `""` | Upstream API key for authenticating with the upstream endpoint |
 | `--auth-token` | `""` | Downstream auth token; clients must provide a matching x-api-key header when set |
@@ -275,6 +276,63 @@ When both `--upstream-api-key` and `--auth-token` are unset, passthrough mode is
 
 When `--auth-token` is set, client requests must include a matching `x-api-key` or `Authorization: Bearer xxx` header, otherwise a 401 is returned. This protects the proxy from unauthorized access.
 
+### Multi-Upstream Routing
+
+Pass `--config <file>` to run a single proxy process against multiple named upstreams. Requests are routed by model name: each route maps a glob pattern to an ordered pool of upstreams, and requests are distributed round-robin within the pool.
+
+```json
+{
+  "port": 8082,
+  "authToken": "",
+  "enableThinking": true,
+  "dumpDir": "",
+  "upstreams": [
+    {
+      "name": "zai-1",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "apiKey": "xxx",
+      "modelOverrides": [
+        { "pattern": "glm-4.7", "extra": { "thinking": { "type": "enabled" } } }
+      ]
+    },
+    { "name": "zai-2", "baseUrl": "https://api.z.ai/api/paas/v4", "apiKey": "yyy" }
+  ],
+  "routes": [
+    { "pattern": "glm-*",      "upstreams": ["zai-1", "zai-2"] },
+    { "pattern": "deepseek-*", "upstreams": ["nim"] },
+    { "pattern": "*",          "upstreams": ["nim"] }
+  ],
+  "serverTools": {
+    "webSearch": false,
+    "webFetch": false,
+    "webSearchEngine": "brave",
+    "webSearchAPIKey": "",
+    "webSearchBaseURL": "https://api.search.brave.com",
+    "webFetchAllowedDomains": [],
+    "webFetchBlockedDomains": [],
+    "webFetchMaxContentTokens": 5000
+  }
+}
+```
+
+- **`upstreams[]`** — Named endpoints. `name` must be unique, `baseUrl` is required, `apiKey` is optional (empty → that upstream receives the client's key via passthrough). Per-upstream `modelOverrides` take the place of global extra params in this mode (same glob → deep-merge semantics as `--upstream-extra-params`).
+- **`routes[]`** — Matched in declaration order; the first glob match wins. The referenced upstream names form the round-robin pool.
+- Top-level fields (`port`, `authToken`, `enableThinking`, `dumpDir`, `serverTools`) mirror their CLI counterparts.
+- `--config` cannot be combined with any other CLI argument. Invalid configs (duplicate names, references to unknown upstreams, empty pools) abort startup with a clear error.
+
+Failover semantics — candidates are tried in order, entirely **before the first byte is written to the client**:
+
+| Upstream behaviour | Action |
+|---|---|
+| Connection failure / timeout | Try the next candidate |
+| HTTP 429 | Try the next candidate |
+| HTTP 5xx | Try the next candidate |
+| Other 4xx | Return immediately, no failover |
+| All candidates failed | Return the last candidate's error |
+| Stream interrupted after it started | Unchanged: `event:error`, no failover |
+
+Endpoint behaviour under routing: `/v1/messages` resolves the route and streams through the candidate chain (the agentic loop re-uses the same failover helper per iteration); `/v1/chat/completions` routes by the request body's `model`; `/v1/models` queries all distinct upstreams concurrently and merges results, deduplicated by id.
+
 ### Request Dumping
 
 Enable `--dump <dir>` to record each downstream request. A session is written to `<dir>/in-progress/<id>/` (where `<id>` is a UUID) and, on completion, renamed into a classification bucket that reflects the **root cause** of the termination:
@@ -374,8 +432,8 @@ docker run -p 8082:8082 chat-to-messages \
 | Path | Method | Description |
 |------|--------|-------------|
 | `/v1/messages` | POST | Anthropic Messages API proxy (core endpoint) |
-| `/v1/chat/completions` | POST | OpenAI Chat Completions passthrough (verbatim, no conversion) |
-| `/v1/models` | GET | OpenAI Models passthrough (verbatim) |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions passthrough (verbatim, no conversion; routed by body `model` with multiple upstreams) |
+| `/v1/models` | GET | OpenAI Models passthrough (merged across upstreams when configured with multiple) |
 | `/health` | GET | Health check |
 
 Unmatched paths return `404` with an Anthropic-format error body.
@@ -534,8 +592,8 @@ This project is a Go port of [chat-to-claude-code](https://github.com/chinfeng/c
 |---------|---------------|-------------------|
 | Runtime | Python 3.14 + FastAPI | Go (single static binary) |
 | External deps | FastAPI, Pydantic, httpx, tiktoken, etc. | Zero (standard library only) |
-| Provider count | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1 (generic OpenAI-compatible endpoint) |
-| Model Router | Opus/Sonnet/Haiku multi-provider routing | None (single upstream) |
+| Provider count | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | Generic OpenAI-compatible endpoints (single by default, multiple via `--config`) |
+| Model Router | Opus/Sonnet/Haiku multi-provider routing | Per-model multi-upstream routing via `--config` |
 | Configuration | Environment variables | CLI startup arguments |
 | Downstream auth | None | AUTH_TOKEN verification |
 | Executable | None | `go build` single binary |
