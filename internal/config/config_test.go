@@ -2,12 +2,18 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 func TestLoadDefaults(t *testing.T) {
-	cfg := Load(nil)
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.UpstreamBaseURL != "https://api.openai.com/v1" {
 		t.Errorf("UpstreamBaseURL = %q", cfg.UpstreamBaseURL)
 	}
@@ -27,7 +33,10 @@ func TestLoadDefaults(t *testing.T) {
 
 // Ported from tests/config.test.ts "loads default config values".
 func TestLoadDefaultsAllFields(t *testing.T) {
-	cfg := Load(nil)
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.UpstreamBaseURL != "https://api.openai.com/v1" {
 		t.Errorf("upstreamBaseUrl = %q", cfg.UpstreamBaseURL)
 	}
@@ -73,7 +82,7 @@ func TestLoadDefaultsAllFields(t *testing.T) {
 }
 
 func TestLoadArgForms(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--upstream-base-url", "https://example.com/v1", // 空格分隔
 		"--auth-token=secret", // = 分隔
 		"--port", "9999",
@@ -85,6 +94,9 @@ func TestLoadArgForms(t *testing.T) {
 		"--web-fetch-blocked-domain", "c.com",
 		"--upstream-extra-params", `claude-*={"thinking":{"type":"enabled","budget_tokens":10000}}`,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.UpstreamBaseURL != "https://example.com/v1" {
 		t.Errorf("base url = %q", cfg.UpstreamBaseURL)
 	}
@@ -122,7 +134,7 @@ func TestLoadArgForms(t *testing.T) {
 
 // Ported from tests/config.test.ts "reads CLI arguments".
 func TestLoadReadsCLIArguments(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--upstream-base-url", "https://custom.api/v1",
 		"--upstream-api-key", "sk-test",
 		"--auth-token", "my-token",
@@ -130,6 +142,9 @@ func TestLoadReadsCLIArguments(t *testing.T) {
 		"--no-enable-thinking",
 		"--dump", "/tmp/dumps",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.UpstreamBaseURL != "https://custom.api/v1" {
 		t.Errorf("base url = %q", cfg.UpstreamBaseURL)
 	}
@@ -166,7 +181,12 @@ func TestLoadPortRangeValidation(t *testing.T) {
 		{args: []string{"--port", "65535"}, want: 65535},       // in-range boundary kept
 		{args: nil, want: 8082},                                // default
 	} {
-		if got := Load(tt.args).Port; got != tt.want {
+		cfg, err := Load(tt.args)
+		if err != nil {
+			t.Errorf("Load(%v): %v", tt.args, err)
+			continue
+		}
+		if got := cfg.Port; got != tt.want {
 			t.Errorf("Load(%v).Port = %d, want %d", tt.args, got, tt.want)
 		}
 	}
@@ -174,7 +194,7 @@ func TestLoadPortRangeValidation(t *testing.T) {
 
 // Ported from tests/config.test.ts "reads server tool CLI arguments".
 func TestLoadServerToolArguments(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--enable-web-search",
 		"--enable-web-fetch",
 		"--web-search-api-key", "BST-xxx",
@@ -184,6 +204,9 @@ func TestLoadServerToolArguments(t *testing.T) {
 		"--web-fetch-blocked-domain", "spam.com",
 		"--web-fetch-max-content-tokens", "10000",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !cfg.ServerTools.WebSearch {
 		t.Error("web search should be true")
 	}
@@ -209,10 +232,13 @@ func TestLoadServerToolArguments(t *testing.T) {
 
 // Ported from tests/config.test.ts "parses --upstream-extra-params with glob=JSON".
 func TestLoadExtraParamsGlobJSON(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--upstream-extra-params", `claude-*={"thinking":{"type":"enabled","budget_tokens":10000}}`,
 		"--upstream-extra-params", `deepseek*={"reasoning_effort":"high"}`,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []ModelOverride{
 		{Pattern: "claude-*", Extra: map[string]any{
 			"thinking": map[string]any{"type": "enabled", "budget_tokens": json.Number("10000")},
@@ -226,7 +252,10 @@ func TestLoadExtraParamsGlobJSON(t *testing.T) {
 
 // Ported from tests/config.test.ts "supports --upstream-extra-params= format".
 func TestLoadExtraParamsEqualsForm(t *testing.T) {
-	cfg := Load([]string{`--upstream-extra-params=*={"stream":true}`})
+	cfg, err := Load([]string{`--upstream-extra-params=*={"stream":true}`})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []ModelOverride{
 		{Pattern: "*", Extra: map[string]any{"stream": true}},
 	}
@@ -236,11 +265,14 @@ func TestLoadExtraParamsEqualsForm(t *testing.T) {
 }
 
 func TestLoadSkipsInvalidExtraParams(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--upstream-extra-params", "no-equals-sign",
 		"--upstream-extra-params", "pat=not-json",
 		"--upstream-extra-params", "pat2=[1,2]",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cfg.ModelOverrides) != 0 {
 		t.Errorf("expected 0 overrides, got %d", len(cfg.ModelOverrides))
 	}
@@ -249,12 +281,15 @@ func TestLoadSkipsInvalidExtraParams(t *testing.T) {
 // Ported from tests/config.test.ts "skips invalid --upstream-extra-params entries gracefully":
 // good*={"ok":1} survives while no-equal-sign, bad={not json} and arr*=[1,2] are skipped.
 func TestLoadSkipsInvalidExtraParamsKeepsValid(t *testing.T) {
-	cfg := Load([]string{
+	cfg, err := Load([]string{
 		"--upstream-extra-params", "no-equal-sign",
 		"--upstream-extra-params", `good*={"ok":1}`,
 		"--upstream-extra-params", "bad={not json}",
 		"--upstream-extra-params", `arr*=[1,2]`,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []ModelOverride{
 		{Pattern: "good*", Extra: map[string]any{"ok": json.Number("1")}},
 	}
@@ -347,5 +382,91 @@ func TestResolveModelExtraFullOverrides(t *testing.T) {
 	}
 	if got := ResolveModelExtra("anything", nil); len(got) != 0 {
 		t.Errorf("nil overrides: %v", got)
+	}
+}
+
+func writeTempConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "routing.json")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadFileFullSchema(t *testing.T) {
+	path := writeTempConfig(t, `{
+	  "port": 9000,
+	  "authToken": "tok",
+	  "enableThinking": false,
+	  "dumpDir": "/tmp/d",
+	  "upstreams": [
+	    {"name":"z1","baseUrl":"https://z.example/v4","apiKey":"k1",
+	     "modelOverrides":[{"pattern":"glm-4.7","extra":{"thinking":{"type":"enabled"}}}]},
+	    {"name":"n1","baseUrl":"https://n.example/v1"}
+	  ],
+	  "routes": [
+	    {"pattern":"glm-*","upstreams":["z1","n1"]},
+	    {"pattern":"*","upstreams":["n1"]}
+	  ],
+	  "serverTools": {"webSearch": true, "webSearchEngine": "searxng"}
+	}`)
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if cfg.Port != 9000 || cfg.AuthToken != "tok" || cfg.EnableThinking || cfg.DumpDir != "/tmp/d" {
+		t.Fatal("top-level fields mismatch")
+	}
+	if len(cfg.Upstreams) != 2 || cfg.Upstreams[0].APIKey != "k1" {
+		t.Fatal("upstreams mismatch")
+	}
+	if len(cfg.Upstreams[0].ModelOverrides) != 1 || cfg.Upstreams[0].ModelOverrides[0].Pattern != "glm-4.7" {
+		t.Fatal("modelOverrides mismatch")
+	}
+	if len(cfg.Routes) != 2 || cfg.Routes[0].Names[0] != "z1" {
+		t.Fatal("routes mismatch")
+	}
+	if !cfg.ServerTools.WebSearch || cfg.ServerTools.WebSearchEngine != "searxng" {
+		t.Fatal("serverTools mismatch")
+	}
+	// legacy 字段清零,file 模式只走 Upstreams/Routes。
+	if cfg.UpstreamBaseURL != "" || cfg.UpstreamAPIKey != "" {
+		t.Fatal("legacy fields must be zero in file mode")
+	}
+	// 默认值:未给出的 serverTools 子项沿用现有默认。
+	cfg2, err := LoadFile(writeTempConfig(t, `{
+	  "upstreams":[{"name":"a","baseUrl":"http://x/v1"}],
+	  "routes":[{"pattern":"*","upstreams":["a"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.Port != 8082 || !cfg2.EnableThinking || cfg2.ServerTools.WebSearchEngine != "brave" ||
+		cfg2.ServerTools.WebSearchBaseURL != "https://api.search.brave.com" ||
+		cfg2.ServerTools.WebFetchMaxContentTokens != 5000 {
+		t.Fatal("defaults not applied")
+	}
+}
+
+func TestLoadFileValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		`{"upstreams":[{"name":"a","baseUrl":""}],"routes":[{"pattern":"*","upstreams":["a"]}]}`:   "baseUrl",
+		`{"upstreams":[{"name":"a","baseUrl":"http://x"}],"routes":[{"pattern":"*","upstreams":["b"]}]}`: "unknown upstream",
+	}
+	for body, want := range cases {
+		if _, err := LoadFile(writeTempConfig(t, body)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("want err containing %q, got %v", want, err)
+		}
+	}
+}
+
+func TestLoadMutualExclusion(t *testing.T) {
+	path := writeTempConfig(t, `{}`)
+	if _, err := Load([]string{"--config", path, "--port", "9999"}); err == nil {
+		t.Fatal("--config plus another flag must error")
+	}
+	cfg, err := Load([]string{"--config", path})
+	if err != nil || cfg.Port != 8082 {
+		t.Fatalf("lone --config should load defaults, got %v", err)
 	}
 }

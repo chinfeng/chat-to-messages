@@ -15,7 +15,10 @@ import (
 )
 
 func main() {
-	cfg := config.Load(os.Args[1:])
+	cfg, err := config.Load(os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	handler := proxy.NewHandler(cfg)
 	srv := &http.Server{
