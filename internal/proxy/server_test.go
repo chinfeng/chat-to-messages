@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1336,6 +1337,157 @@ func TestRoutedToConfiguredUpstream(t *testing.T) {
 	// effectiveKey: the upstream's own key wins over the client key.
 	if !strings.Contains(gotAuth, "k-z") {
 		t.Errorf("upstream key not used: %q", gotAuth)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: pre-stream failover across the candidate chain.
+// ---------------------------------------------------------------------------
+
+func TestFailoverOn500(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":{"message":"boom"}}`)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, typicalUpstreamSSE())
+	}))
+	defer second.Close()
+
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{
+			{Name: "bad", BaseURL: first.URL},
+			{Name: "good", BaseURL: second.URL},
+		},
+		Routes:  []config.Route{{Pattern: "*", Names: []string{"bad", "good"}}},
+		DumpDir: t.TempDir(),
+	}
+	h := NewHandler(cfg)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, map[string]string{"x-api-key": "client-key"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("200 expected after failover, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	events := eventTypes(parseSSE(t, string(body)))
+	if !contains(events, "message_start") || !contains(events, "message_stop") {
+		t.Errorf("good upstream stream incomplete: %v\nbody = %s", events, body)
+	}
+	// The skipped attempt must be in the dump attempt trail.
+	renamedDir := readDumpEntry(t, cfg.DumpDir, "completed")
+	data, err := os.ReadFile(filepath.Join(renamedDir, "upstream-attempts.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "bad") || !strings.Contains(s, "skipped") {
+		t.Errorf("attempts log missing bad/skipped entry: %s", s)
+	}
+	if !strings.Contains(s, "Status: 500") {
+		t.Errorf("attempts log missing 500 status: %s", s)
+	}
+}
+
+func TestNoFailoverOn400(t *testing.T) {
+	var secondHit bool
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":{"message":"not here"}}`)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHit = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer second.Close()
+
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{
+			{Name: "bad", BaseURL: first.URL},
+			{Name: "good", BaseURL: second.URL},
+		},
+		Routes: []config.Route{{Pattern: "*", Names: []string{"bad", "good"}}},
+	}
+	h := NewHandler(cfg)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, map[string]string{"x-api-key": "client-key"})
+	if resp.StatusCode != 404 {
+		t.Fatalf("404 expected (non-retryable passes through), got %d", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, "Upstream returned 404") {
+		t.Errorf("body = %s", body)
+	}
+	if secondHit {
+		t.Error("failover must not happen on non-retryable status")
+	}
+}
+
+func TestFailoverOnConnectRefused(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // port released → connection refused
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, typicalUpstreamSSE())
+	}))
+	defer second.Close()
+
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{
+			{Name: "dead", BaseURL: deadURL},
+			{Name: "good", BaseURL: second.URL},
+		},
+		Routes: []config.Route{{Pattern: "*", Names: []string{"dead", "good"}}},
+	}
+	h := NewHandler(cfg)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, map[string]string{"x-api-key": "client-key"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("200 expected after failover, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	events := eventTypes(parseSSE(t, string(body)))
+	if !contains(events, "message_start") || !contains(events, "message_stop") {
+		t.Errorf("good upstream stream incomplete: %v\nbody = %s", events, body)
+	}
+}
+
+func TestRoundRobinDistribution(t *testing.T) {
+	var hits1, hits2 atomic.Int64
+	up1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits1.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up1.Close()
+	up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits2.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up2.Close()
+
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{
+			{Name: "u1", BaseURL: up1.URL},
+			{Name: "u2", BaseURL: up2.URL},
+		},
+		Routes: []config.Route{{Pattern: "*", Names: []string{"u1", "u2"}}},
+	}
+	h := NewHandler(cfg)
+	for i := 0; i < 2; i++ {
+		resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, map[string]string{"x-api-key": "client-key"})
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: 200 expected, got %d", i, resp.StatusCode)
+		}
+		io.Copy(io.Discard, resp.Body)
+	}
+	// Two requests over a two-upstream pool: the round-robin cursor alternates
+	// the chain start, and both upstreams are healthy → one hit each.
+	if hits1.Load() != 1 || hits2.Load() != 1 {
+		t.Errorf("hits = %d/%d, want 1/1", hits1.Load(), hits2.Load())
 	}
 }
 

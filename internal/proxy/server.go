@@ -7,7 +7,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,8 +134,11 @@ func headerMap(h http.Header) map[string]string {
 }
 
 // NewHandler returns the HTTP handler for the proxy: CORS preflight handling
-// first (matching Bun.serve in index.ts), then routing.
+// first (matching Bun.serve in index.ts), then routing. The router — and with
+// it the round-robin cursors — is built once per handler so the rotation
+// state persists across requests.
 func NewHandler(cfg *config.Config) http.Handler {
+	rt := cfg.Router()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -143,21 +148,21 @@ func NewHandler(cfg *config.Config) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		handleRequest(w, r, cfg)
+		handleRequest(w, r, cfg, rt)
 	})
 }
 
 // handleRequest routes a request (port of routeRequest() in routes.ts).
-func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
-		handleMessages(w, r, cfg)
+		handleMessages(w, r, cfg, rt)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-		forwardPassthrough(w, r, cfg, "/chat/completions")
+		forwardPassthrough(w, r, cfg, rt, "/chat/completions")
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
-		forwardPassthrough(w, r, cfg, "/models")
+		forwardPassthrough(w, r, cfg, rt, "/models")
 	default:
 		writeJSON(w, http.StatusNotFound, notFoundError(fmt.Sprintf("No route for %s %s", r.Method, r.URL.Path)))
 	}
@@ -295,7 +300,7 @@ func buildUpstreamRequestBodyOnly(u *config.Upstream, requestData *convert.Reque
 
 // handleMessages handles POST /v1/messages (port of handleMessages() in
 // routes.ts): auth, body validation, upstream request, and the SSE pump.
-func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router) {
 	session := dump.NewSession(cfg.DumpDir)
 	requestStart := time.Now()
 	requestDatetime := time.Now().UTC().Format(time.RFC3339)
@@ -355,7 +360,6 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	}
 
 	// --- Routing: resolve the model to an ordered candidate chain ---
-	rt := cfg.Router()
 	if rt == nil {
 		session.Finish()
 		writeJSON(w, http.StatusInternalServerError, serverError("Invalid upstream configuration."))
@@ -401,27 +405,38 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	}
 
 	// --- Standard streaming flow (no server tools) ---
-	url, wireBody, prettyBody, err := buildUpstreamRequest(upstream, requestData, apiKey)
-	if err != nil {
-		session.Finish()
-		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
-		return
+	// mkReq builds one candidate's upstream request. WriteUpstreamRequest is an
+	// overwrite: the final file records the LAST attempt, and
+	// upstream-attempts.log carries the full trail.
+	mkReq := func(u *config.Upstream, apiKey string) (*http.Request, error) {
+		// Non-passthrough parity for failover targets (candidates[0] was
+		// checked above): a keyless candidate must never receive the
+		// downstream auth token.
+		if u.APIKey == "" && cfg.AuthToken != "" {
+			return nil, errNoAPIKey
+		}
+		_, wireBody, prettyBody, err := buildUpstreamRequest(u, requestData, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+			strings.TrimRight(u.BaseURL, "/")+"/chat/completions", bytes.NewReader(wireBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		session.WriteUpstreamRequest(headerMap(req.Header), time.Now().UTC().Format(time.RFC3339), string(prettyBody))
+		return req, nil
 	}
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(wireBody))
-	if err != nil {
-		session.Finish()
-		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
-		return
-	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
-	upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
-	session.WriteUpstreamRequest(headerMap(upstreamReq.Header), time.Now().UTC().Format(time.RFC3339), string(prettyBody))
 
-	// The request context is the abort signal: the client's disconnect cancels
-	// the upstream fetch. No client timeout — the ctx propagates.
-	client := &http.Client{}
-	upstreamRes, err := client.Do(upstreamReq)
+	upstreamRes, err := postWithFailover(r.Context(), candidates, clientKey, mkReq, session)
 	if err != nil {
+		if errors.Is(err, errNoAPIKey) {
+			session.Finish()
+			writeJSON(w, http.StatusUnauthorized, authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+			return
+		}
 		handleUpstreamConnectError(w, session, r, requestStart, err)
 		return
 	}
@@ -579,6 +594,72 @@ func writeEvent(w http.ResponseWriter, flusher http.Flusher, event string, downs
 	flusher.Flush()
 }
 
+// errNoAPIKey marks a candidate whose resolved API key is empty (no upstream
+// key and no client key to forward), or a keyless candidate reached while a
+// downstream auth token is configured (the mkReq closure refuses to forward
+// the token). handleMessages maps it to the existing 401 message.
+var errNoAPIKey = errors.New("no api key")
+
+// postWithFailover tries candidates in order until one responds without a
+// retryable failure. Retryable: transport error, HTTP 429, HTTP 5xx. Skipped
+// attempts land in the dump attempt trail. When every candidate fails, the
+// LAST candidate's outcome is returned verbatim so the caller maps it exactly
+// as before: a retryable status response → handleUpstreamErrorStatus, a
+// transport error → handleUpstreamConnectError.
+func postWithFailover(ctx context.Context, candidates []*config.Upstream, clientKey string,
+	mkReq func(u *config.Upstream, apiKey string) (*http.Request, error),
+	session *dump.Session) (*http.Response, error) {
+
+	client := &http.Client{}
+	var (
+		lastRetryableRes *http.Response // last 429/5xx response
+		lastErr          error          // last transport error
+	)
+	for i, u := range candidates {
+		apiKey := effectiveKey(u, clientKey)
+		if apiKey == "" {
+			return nil, errNoAPIKey
+		}
+		req, err := mkReq(u, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		url := strings.TrimRight(u.BaseURL, "/") + "/chat/completions"
+		res, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, err // client disconnected — do not fail over
+			}
+			session.LogUpstreamAttempt(u.Name, url, 0, "skipped: connect failed ("+err.Error()+")")
+			lastRetryableRes, lastErr = nil, err
+			continue
+		}
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			session.LogUpstreamAttempt(u.Name, url, res.StatusCode, fmt.Sprintf("skipped: retryable status %d", res.StatusCode))
+			lastRetryableRes, lastErr = res, nil
+			// Drain and close unless this is the final candidate — its
+			// response still goes back to the caller, which needs the body
+			// for the existing error mapping.
+			if i < len(candidates)-1 {
+				_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+				res.Body.Close()
+			}
+			continue
+		}
+		if i > 0 {
+			session.LogUpstreamAttempt(u.Name, url, res.StatusCode, "served after failover")
+		}
+		return res, nil
+	}
+	if lastRetryableRes != nil {
+		return lastRetryableRes, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("no candidates")
+}
+
 // handleUpstreamConnectError handles a client.Do failure (port of the TS
 // fetch catch): 499 when the client disconnected, 502 otherwise.
 func handleUpstreamConnectError(w http.ResponseWriter, session *dump.Session, r *http.Request, requestStart time.Time, connectErr error) {
@@ -653,14 +734,13 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 // same body, resolved Authorization header. The upstream response (status
 // code, Content-Type, body) is relayed unchanged. Used by POST
 // /v1/chat/completions and GET /v1/models.
-func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, upstreamPath string) {
+func forwardPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, rt *config.Router, upstreamPath string) {
 	if !validateAuthToken(r, cfg) {
 		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
 		return
 	}
 	// Normalize through the router so file mode (legacy fields zeroed)
 	// resolves its first distinct upstream. Task 6 splits this properly.
-	rt := cfg.Router()
 	if rt == nil {
 		writeJSON(w, http.StatusInternalServerError, openAIError("api_error", "Invalid upstream configuration."))
 		return
