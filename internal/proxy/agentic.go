@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -241,19 +242,6 @@ type serverToolEvent struct {
 	status    string
 }
 
-// postUpstream POSTs a JSON body to the upstream chat/completions endpoint
-// with the given headers and request context (port of the TS fetch call).
-func postUpstream(ctx context.Context, url string, headers map[string]string, body []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	return (&http.Client{}).Do(req)
-}
-
 // handleAgenticLoopFetchError handles a connect failure inside the agentic
 // loop (port of the TS loop fetch catch): 499 + client_abort when the client
 // disconnected, 502 + upstream_timeout otherwise.
@@ -303,23 +291,24 @@ func handleAgenticLoopErrorStatus(w http.ResponseWriter, session *dump.Session, 
 func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, candidates []*config.Upstream, clientKey string, inputTokens int64) {
 	onLog := session.LogServerTool
 
-	// Single-candidate semantics; Task 7 adds failover across the chain.
-	u := candidates[0]
-	apiKey := effectiveKey(u, clientKey)
+	// Defensive: handleMessages resolves at least one candidate before
+	// dispatching here; direct-struct construction could bypass that.
+	if len(candidates) == 0 {
+		session.Finish()
+		writeJSON(w, http.StatusServiceUnavailable, serverError("No upstream configured."))
+		return
+	}
 
 	// Build the initial upstream request body (the full body — Claude Code
-	// puts server tools in the tools array, so the schemas ride along).
-	upstreamURL, initialBody, err := buildUpstreamRequestBodyOnly(u, requestData)
+	// puts server tools in the tools array, so the schemas ride along). Only
+	// the parsed messages/tools are consumed from it; every request is issued
+	// through postWithFailover with per-candidate mkReq closures below.
+	_, initialBody, err := buildUpstreamRequestBodyOnly(candidates[0], requestData)
 	if err != nil {
 		session.Finish()
 		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
 		return
 	}
-	upstreamHeadersObj := map[string]string{
-		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + apiKey,
-	}
-	session.WriteUpstreamRequest(upstreamHeadersObj, nowISO(), string(initialBody))
 
 	// Parse the initial body to get the messages array (we append to it in
 	// the loop) and the tools array.
@@ -331,6 +320,29 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 	}
 	upstreamMessages, _ := initialBodyParsed["messages"].([]any)
 	upstreamTools := initialBodyParsed["tools"]
+
+	// mkReqFor builds one candidate's upstream request for a given wire body.
+	// WriteUpstreamRequest is an overwrite: the dump records the LAST attempt,
+	// and upstream-attempts.log carries the full trail (same pattern as
+	// handleMessages).
+	mkReqFor := func(wire []byte) func(*config.Upstream, string) (*http.Request, error) {
+		return func(u *config.Upstream, apiKey string) (*http.Request, error) {
+			// Non-passthrough parity: a keyless candidate must never receive
+			// the downstream auth token.
+			if u.APIKey == "" && cfg.AuthToken != "" {
+				return nil, errNoAPIKey
+			}
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+				strings.TrimRight(u.BaseURL, "/")+"/chat/completions", bytes.NewReader(wire))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			session.WriteUpstreamRequest(headerMap(req.Header), time.Now().UTC().Format(time.RFC3339), string(wire))
+			return req, nil
+		}
+	}
 
 	var serverToolEvents []serverToolEvent
 	iteration := 0
@@ -374,8 +386,13 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 			DurationMs: &ms,
 		})
 
-		upstreamRes, err := postUpstream(r.Context(), upstreamURL, upstreamHeadersObj, currentBody)
+		upstreamRes, err := postWithFailover(r.Context(), candidates, clientKey, mkReqFor(currentBody), session)
 		if err != nil {
+			if errors.Is(err, errNoAPIKey) {
+				session.Finish()
+				writeJSON(w, http.StatusUnauthorized, authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+				return
+			}
 			handleAgenticLoopFetchError(w, session, r, iteration, err)
 			return
 		}
@@ -587,8 +604,13 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 		return
 	}
 
-	finalRes, err := postUpstream(r.Context(), upstreamURL, upstreamHeadersObj, finalWire)
+	finalRes, err := postWithFailover(r.Context(), candidates, clientKey, mkReqFor(finalWire), session)
 	if err != nil {
+		if errors.Is(err, errNoAPIKey) {
+			session.Finish()
+			writeJSON(w, http.StatusUnauthorized, authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token)."))
+			return
+		}
 		// TS: upstream_timeout dump + finish, then a plain 502 (no downstream
 		// response log on this path).
 		termination := &dump.Termination{Reason: dump.UpstreamTimeout, DisconnectTime: nowISO()}

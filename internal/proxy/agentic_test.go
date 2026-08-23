@@ -18,6 +18,8 @@ import (
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -318,6 +320,72 @@ func TestAgenticLoopWebFetch(t *testing.T) {
 	}
 	if !strings.Contains(joined, "fetch answer") {
 		t.Errorf("final text missing: %s", joined)
+	}
+}
+
+// TestAgenticLoopFailsOver covers the candidate chain in the agentic loop:
+// pool [bad(→500), good]. The good upstream answers with a plain text SSE
+// stream (no tool call → one agentic round), the client still gets 200 +
+// message_stop, and the dump attempt trail records the skipped bad upstream.
+// Each of the two proxy POSTs (loop round + final streaming request) rides the
+// chain, so bad and good each see 2 requests.
+func TestAgenticLoopFailsOver(t *testing.T) {
+	badCalls, goodCalls := atomic.Int32{}, atomic.Int32{}
+	textSSE := "data: {\"choices\":[{\"delta\":{\"content\":\"failed-over answer\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":{"message":"boom"}}`)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := goodCalls.Add(1)
+		if n > 2 {
+			t.Errorf("good upstream hit %d times, want <= 2 (loop round + final)", n)
+		}
+		io.WriteString(w, textSSE)
+	}))
+	defer good.Close()
+
+	cfg := &config.Config{
+		Upstreams: []*config.Upstream{
+			{Name: "bad", BaseURL: bad.URL},
+			{Name: "good", BaseURL: good.URL},
+		},
+		Routes:      []config.Route{{Pattern: "*", Names: []string{"bad", "good"}}},
+		DumpDir:     t.TempDir(),
+		ServerTools: config.ServerToolConfig{WebSearch: true},
+	}
+	h := NewHandler(cfg)
+	body := `{"model":"m","messages":[{"role":"user","content":"x"}],"server_tools":[{"type":"web_search_20250305","name":"web_search"}]}`
+	resp := postMessages(t, h, body, map[string]string{"x-api-key": "client-key"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("200 expected after failover, got %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	events := eventTypes(parseSSE(t, string(raw)))
+	if len(events) == 0 || events[len(events)-1] != "message_stop" {
+		t.Fatalf("last event = %v\nbody = %s", events, raw)
+	}
+	if !strings.Contains(string(raw), "failed-over answer") {
+		t.Errorf("final text missing: %s", raw)
+	}
+	if badCalls.Load() != 2 || goodCalls.Load() != 2 {
+		t.Errorf("calls = bad:%d good:%d, want 2/2 (loop round + final, each riding the chain)", badCalls.Load(), goodCalls.Load())
+	}
+
+	// The skipped attempt must be in the dump attempt trail.
+	renamedDir := readDumpEntry(t, cfg.DumpDir, "completed")
+	data, err := os.ReadFile(filepath.Join(renamedDir, "upstream-attempts.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "bad") || !strings.Contains(s, "skipped") {
+		t.Errorf("attempts log missing bad/skipped entry: %s", s)
 	}
 }
 
