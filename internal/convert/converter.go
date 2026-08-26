@@ -4,6 +4,7 @@ package convert
 
 import (
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -31,6 +32,19 @@ const (
 // thinkTagContent mirrors thinkTagContent() in converter.ts.
 func thinkTagContent(reasoning string) string {
 	return "<think>\n" + reasoning + "\n</think>"
+}
+
+// sigMarkerRe matches the proxy-fabricated thinking-signature marker. These
+// markers must never reach the upstream model: kimi-k3 imitates them when they
+// appear in its own past turns (dumped 2026-08-26 — it emitted fresh
+// <!--sig:<hex64>--> comments as literal text, then ended the turn with no
+// tool call, breaking the agent loop).
+var sigMarkerRe = regexp.MustCompile(`<!--sig:[0-9a-f]{64}-->`)
+
+// scrubSigMarkers removes signature markers from assistant text replayed
+// upstream (both legacy injected ones and model-mimicked echoes).
+func scrubSigMarkers(text string) string {
+	return sigMarkerRe.ReplaceAllString(text, "")
 }
 
 // toolInputSchema mirrors toolInputSchema() in converter.ts.
@@ -229,27 +243,17 @@ func convertAssistantMessage(content []anthropic.ContentBlock, reasoningContent 
 		block := &content[i]
 		switch block.Type {
 		case "text":
-			contentParts = append(contentParts, block.Text)
+			contentParts = append(contentParts, scrubSigMarkers(block.Text))
 		case "thinking":
 			if reasoningReplay == ReplayDisabled {
 				continue
 			}
-			thinking := block.Thinking
-			signature := block.Signature
+			// The fabricated signature is proxy-internal state; injecting it
+			// upstream teaches the model to emit <!--sig:...--> itself.
 			if reasoningReplay == ReplayThinkTags {
-				tagged := thinkTagContent(thinking)
-				if signature != "" {
-					// Preserve the signature as an opaque prefix delimiter
-					// that round-trips across turns; the proxy strips it on
-					// re-ingestion.
-					tagged = "<!--sig:" + signature + "-->\n" + tagged
-				}
-				contentParts = append(contentParts, tagged)
+				contentParts = append(contentParts, thinkTagContent(block.Thinking))
 			} else if !hasReasoning {
-				thinkingParts = append(thinkingParts, thinking)
-				if signature != "" {
-					thinkingParts = append(thinkingParts, "<!--sig:"+signature+"-->")
-				}
+				thinkingParts = append(thinkingParts, block.Thinking)
 			}
 		case "redacted_thinking":
 			if reasoningReplay == ReplayDisabled {

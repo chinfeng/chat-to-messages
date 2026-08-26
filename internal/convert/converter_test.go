@@ -84,8 +84,13 @@ func TestConvertThinkingThinkTags(t *testing.T) {
 		t.Fatalf("msgs = %d", len(got))
 	}
 	content := got[0]["content"].(string)
-	if !strings.Contains(content, "<!--sig:sig123-->") || !strings.Contains(content, "<think>\nhmm\n</think>") || !strings.Contains(content, "answer") {
+	if !strings.Contains(content, "<think>\nhmm\n</think>") || !strings.Contains(content, "answer") {
 		t.Errorf("content = %q", content)
+	}
+	// 伪造签名是 proxy 内部状态；注入上游会教模型模仿（kimi 输出
+	// <!--sig:...--> 后 end_turn，agent loop 中断），绝不能出现在模型可见上下文。
+	if strings.Contains(content, "sig:") {
+		t.Errorf("signature leaked upstream: %q", content)
 	}
 }
 
@@ -110,7 +115,7 @@ func TestConvertThinkingReasoningContent(t *testing.T) {
 	msgs := []anthropic.Message{{
 		Role: "assistant",
 		Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
-			{Type: "thinking", Thinking: "hmm"},
+			{Type: "thinking", Thinking: "hmm", Signature: "sig123"},
 			{Type: "text", Text: "answer"},
 		}},
 	}}
@@ -118,8 +123,35 @@ func TestConvertThinkingReasoningContent(t *testing.T) {
 	if got[0]["reasoning_content"] != "hmm" {
 		t.Errorf("reasoning_content = %v", got[0]["reasoning_content"])
 	}
+	if rc, ok := got[0]["reasoning_content"].(string); ok && strings.Contains(rc, "sig:") {
+		t.Errorf("signature leaked into reasoning_content: %q", rc)
+	}
 	if got[0]["content"] != "answer" {
 		t.Errorf("content = %v", got[0]["content"])
+	}
+}
+
+// 已被污染的会话里，kimi 模仿输出的 <!--sig:<hex64>--> 会作为 assistant text
+// 块回流；转上游时必须剥掉，否则模型继续看到并延续该模式。
+func TestConvertAssistantTextScrubbedOfSigMarkers(t *testing.T) {
+	sigA := strings.Repeat("a", 64)
+	sigB := strings.Repeat("b", 64)
+	msgs := []anthropic.Message{{
+		Role: "assistant",
+		Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "<!--sig:" + sigA + "-->\n"},
+			{Type: "text", Text: "working on it <!--sig:" + sigB + "-->\nstill here"},
+		}},
+	}}
+	got := convert(t, msgs, ReplayThinkTags)
+	content := got[0]["content"].(string)
+	if strings.Contains(content, "sig:") {
+		t.Errorf("mimicked sig marker leaked upstream: %q", content)
+	}
+	for _, want := range []string{"working on it", "still here"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("lost %q from %q", want, content)
+		}
 	}
 }
 
