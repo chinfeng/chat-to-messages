@@ -41,10 +41,35 @@ func thinkTagContent(reasoning string) string {
 // tool call, breaking the agent loop).
 var sigMarkerRe = regexp.MustCompile(`<!--sig:[0-9a-f]{64}-->`)
 
+// interruptMarkerRe matches the Claude Code CLI's tool-use-interruption UI
+// markers. When a tool call is interrupted, the CLI records a self-contained
+// assistant text turn `[Tool use interrupted]` (and, mid-call, the orphaned
+// `</parameter>\n</invoke>\nNo result from invoke.` tail). If these strings are
+// replayed upstream they teach the model the pattern and it starts emitting
+// them verbatim as its whole reply before end_turn with no tool call — the same
+// imitation failure as the sig markers above (dumped 2026-08-27, kimi-k3).
+// They are client-side rendering only, never legitimate model content on the
+// replay path (structured tool_use blocks carry real tool calls), so they are
+// stripped as whole phrases.
+var interruptMarkerRe = regexp.MustCompile(`\[Tool use interrupted\]|No result from invoke\.|</parameter>|</invoke>`)
+
 // scrubSigMarkers removes signature markers from assistant text replayed
 // upstream (both legacy injected ones and model-mimicked echoes).
 func scrubSigMarkers(text string) string {
 	return sigMarkerRe.ReplaceAllString(text, "")
+}
+
+// scrubClientControlMarkers removes Claude Code UI control markers (thinking
+// signatures and tool-use interruption) from assistant text replayed upstream.
+// The proxy re-submits prior assistant turns as model context; any client
+// rendering marker in that context is imitated by GLM-family models and
+// truncates the agent loop, so none may reach the upstream model.
+func scrubClientControlMarkers(text string) string {
+	if text == "" {
+		return text
+	}
+	text = scrubSigMarkers(text)
+	return interruptMarkerRe.ReplaceAllString(text, "")
 }
 
 // toolInputSchema mirrors toolInputSchema() in converter.ts.
@@ -243,7 +268,7 @@ func convertAssistantMessage(content []anthropic.ContentBlock, reasoningContent 
 		block := &content[i]
 		switch block.Type {
 		case "text":
-			contentParts = append(contentParts, scrubSigMarkers(block.Text))
+			contentParts = append(contentParts, scrubClientControlMarkers(block.Text))
 		case "thinking":
 			if reasoningReplay == ReplayDisabled {
 				continue

@@ -155,6 +155,37 @@ func TestConvertAssistantTextScrubbedOfSigMarkers(t *testing.T) {
 	}
 }
 
+// 已被污染的会话里，模型会把 Claude Code 的「工具调用被打断」UI 标记
+// （[Tool use interrupted] / </parameter> / </invoke> / No result from invoke.）
+// 作为 assistant text 块回流；转上游时必须剥掉，否则模型继续模仿并以
+// end_turn、无 tool call 收尾，agent loop 中断（dumped 2026-08-27，kimi-k3）。
+func TestConvertAssistantTextScrubbedOfInterruptMarkers(t *testing.T) {
+	msgs := []anthropic.Message{{
+		Role: "assistant",
+		Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "[Tool use interrupted]"},
+			{Type: "text", Text: "[Tool use interrupted]\n</parameter>\n</invoke>\nNo result from invoke."},
+		}},
+	}}
+	got := convert(t, msgs, ReplayThinkTags)
+	content := got[0]["content"].(string)
+	for _, banned := range []string{
+		"[Tool use interrupted]",
+		"No result from invoke",
+		"</parameter>",
+		"</invoke>",
+	} {
+		if strings.Contains(content, banned) {
+			t.Errorf("interrupt marker %q leaked upstream: %q", banned, content)
+		}
+	}
+	// Empty text blocks still join to whitespace; the invariant under test is
+	// that no control marker survives, not that the result is non-whitespace.
+	if strings.TrimSpace(content) != "" {
+		t.Errorf("unexpected non-whitespace residue: %q", content)
+	}
+}
+
 func TestConvertToolUseCanonicalArgs(t *testing.T) {
 	msgs := []anthropic.Message{{
 		Role: "assistant",
