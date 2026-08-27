@@ -155,6 +155,51 @@ func TestConvertAssistantTextScrubbedOfSigMarkers(t *testing.T) {
 	}
 }
 
+// 已被污染的会话里，模型会把 Claude Code 的「工具调用被打断」UI 文本
+// （[Tool use interrupted] / No result from invoke.）作为 assistant text 块
+// 回流；转上游时必须剥掉，否则模型继续模仿并以 end_turn、无 tool call 收尾，
+// agent loop 中断（dumped 2026-08-27，kimi-k3）。
+func TestConvertAssistantTextScrubbedOfInterruptMarkers(t *testing.T) {
+	msgs := []anthropic.Message{{
+		Role: "assistant",
+		Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "[Tool use interrupted]"},
+			{Type: "text", Text: "No result from invoke."},
+		}},
+	}}
+	got := convert(t, msgs, ReplayThinkTags)
+	content := got[0]["content"].(string)
+	for _, banned := range []string{
+		"[Tool use interrupted]",
+		"No result from invoke",
+	} {
+		if strings.Contains(content, banned) {
+			t.Errorf("interrupt marker %q leaked upstream: %q", banned, content)
+		}
+	}
+	if strings.TrimSpace(content) != "" {
+		t.Errorf("unexpected non-whitespace residue: %q", content)
+	}
+}
+
+// GLM 家族用 <parameter>/</parameter>/<invoke> 作为原生工具调用协议，重放时
+// 绝不能剥掉这些标签，否则会破坏模型回流给 Claude Code 的工具参数。
+func TestConvertAssistantTextPreservesGLMToolCallTags(t *testing.T) {
+	msgs := []anthropic.Message{{
+		Role: "assistant",
+		Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "<invoke>query</invoke><parameter>foo</parameter>"},
+		}},
+	}}
+	got := convert(t, msgs, ReplayThinkTags)
+	content := got[0]["content"].(string)
+	for _, keep := range []string{"<invoke>", "</invoke>", "<parameter>", "</parameter>"} {
+		if !strings.Contains(content, keep) {
+			t.Errorf("GLM tool-call tag %q was stripped: %q", keep, content)
+		}
+	}
+}
+
 func TestConvertToolUseCanonicalArgs(t *testing.T) {
 	msgs := []anthropic.Message{{
 		Role: "assistant",
