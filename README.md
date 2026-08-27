@@ -135,6 +135,9 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--port` | `8082` | HTTP listen port |
 | `--enable-thinking` | `true` | Convert upstream reasoning content to Anthropic thinking blocks |
 | `--no-enable-thinking` | — | Disable thinking conversion |
+| `--sanitize-client-meta-turns` | `true` | Normalize Claude Code's synthetic user turns (`[Your previous response had no visible output...]`, `(no content)`, interruption markers) before replaying them upstream |
+| `--empty-turn-guard` | `true` | Retry the upstream request when a turn ends with reasoning but no visible text and no tool call (kimi-k3/GLM collapse guard) |
+| `--empty-turn-retries` | `2` | Max empty-turn retry attempts per request (0-5) |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
 | `--enable-web-search` | `false` | Enable proxy-side web search |

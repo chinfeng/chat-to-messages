@@ -7,10 +7,13 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -297,6 +300,91 @@ func buildUpstreamRequestBodyOnly(cfg *config.Config, requestData *convert.Reque
 	return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions", wire, nil
 }
 
+// emptyTurnRetryHint is the corrective user cue appended after the abandoned
+// turn when the empty-turn guard re-requests upstream. Deliberately free of
+// accusation framing ("you produced nothing visible") — that framing fed
+// kimi-k3's imitation collapse (dumped 2026-08-27).
+const emptyTurnRetryHint = "Your previous turn ended without any tool call or visible answer. Continue your task now: emit the needed tool call(s), or a concise final answer."
+
+// invisibleTurnRetryMessages appends the abandoned turn (replayed as its own
+// assistant turn, reasoning in the think-tag form kimi upstreams emit natively)
+// plus the corrective cue, so the retry request reads as an ordinary
+// continuation ending on a user turn.
+func invisibleTurnRetryMessages(req *convert.RequestData, info stream.InvisibleTurnInfo) []anthropic.Message {
+	assistantText := ""
+	if strings.TrimSpace(info.Reasoning) != "" {
+		assistantText = "<think>\n" + info.Reasoning + "\n</think>\n\n"
+	}
+	assistantText += info.VisibleText
+	out := make([]anthropic.Message, 0, len(req.Messages)+2)
+	out = append(out, req.Messages...)
+	out = append(out,
+		anthropic.Message{
+			Role:    "assistant",
+			Content: anthropic.ContentValue{IsString: true, Str: assistantText},
+		},
+		anthropic.Message{
+			Role:    "user",
+			Content: anthropic.ContentValue{IsString: true, Str: emptyTurnRetryHint},
+		},
+	)
+	return out
+}
+
+// emptyTurnRetryHook builds the stream.Options InvisibleTurnRetry callback for
+// a /v1/messages request. The returned closure enforces the configured budget;
+// each retry is logged to numbered dump attempt files. Returning nil (budget
+// exhausted or any failure) degrades the stream layer to its baseline
+// invisible-turn finalize.
+func emptyTurnRetryHook(ctx context.Context, cfg *config.Config, session *dump.Session, requestData *convert.RequestData, apiKey string) func(int, stream.InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+	return func(attempt int, info stream.InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+		if !cfg.EmptyTurnGuard || attempt > cfg.EmptyTurnMaxRetries {
+			return nil
+		}
+		attemptNo := attempt + 1 // dump numbering: primary request = attempt 1
+
+		retryReq := *requestData
+		retryReq.Messages = invisibleTurnRetryMessages(requestData, info)
+		url, wire, pretty, err := buildUpstreamRequest(cfg, &retryReq, apiKey)
+		if err != nil {
+			return nil
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
+		if err != nil {
+			return nil
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		session.WriteUpstreamAttemptRequest(attemptNo, headerMap(httpReq.Header), time.Now().UTC().Format(time.RFC3339), string(pretty))
+
+		res, err := (&http.Client{}).Do(httpReq)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "chat-to-messages: empty-turn guard retry connect failed:", err)
+			return nil
+		}
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+			res.Body.Close()
+			session.WriteUpstreamAttemptResponse(attemptNo, headerMap(res.Header), res.StatusCode, string(body))
+			fmt.Fprintln(os.Stderr, "chat-to-messages: empty-turn guard retry got status", res.StatusCode)
+			return nil
+		}
+
+		var raw strings.Builder
+		seq := openai.IterSSEChunks(ctx, res.Body, &raw)
+		return func(yield func(openai.Chunk) bool) {
+			defer res.Body.Close()
+			for chunk := range seq {
+				if !yield(chunk) {
+					return
+				}
+			}
+			session.WriteUpstreamAttemptResponse(attemptNo, headerMap(res.Header), res.StatusCode, raw.String())
+		}
+	}
+}
+
 // handleMessages handles POST /v1/messages (port of handleMessages() in
 // routes.ts): auth, body validation, upstream request, and the SSE pump.
 func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
@@ -374,6 +462,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		Tools:         req.Tools,
 		ToolChoice:    req.ToolChoice,
 		ServerTools:   req.ServerTools,
+
+		SanitizeClientMetaTurns: cfg.SanitizeClientMetaTurns,
 	}
 	inputTokens := convert.EstimateInputTokens(req.Messages)
 
@@ -445,7 +535,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	var downstreamChunks []string
 
 	streamer := stream.NewStreamer(r.Context(), chunks, requestData, inputTokens, cfg.EnableThinking, session,
-		&stream.Options{IsDownstreamAborted: func() bool { return downstreamAborted.Load() }})
+		&stream.Options{
+			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
+			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
+		})
 
 	// terminationReason is written by the pump goroutine (stream error
 	// branch) and the select loop (client-abort branch) and read by

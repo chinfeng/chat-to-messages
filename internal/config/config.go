@@ -39,6 +39,24 @@ type Config struct {
 	DumpDir         string
 	ModelOverrides  []ModelOverride
 	ServerTools     ServerToolConfig
+
+	// SanitizeClientMetaTurns normalizes Claude Code's synthetic user meta
+	// turns ("[Your previous response had no visible output...]", "(no
+	// content)", interruption markers) before they are replayed to the
+	// upstream model. These recovery-loop turns are imitation poison for
+	// kimi/GLM-family models (dumped 2026-08-27): repeated exposure teaches
+	// them thinking-only / whitespace replies until the agent loop dies.
+	SanitizeClientMetaTurns bool
+	// EmptyTurnGuard retries the upstream request when a streaming turn ends
+	// with reasoning but NO visible text and NO tool call while tools were
+	// offered — the signature of an upstream model abandoning its turn
+	// mid-plan (kimi-k3 collapse). The retry appends the abandoned turn plus
+	// a corrective cue to the conversation and continues the same downstream
+	// SSE message.
+	EmptyTurnGuard bool
+	// EmptyTurnMaxRetries bounds EmptyTurnGuard re-requests per downstream
+	// request (clamped to 0-5).
+	EmptyTurnMaxRetries int
 }
 
 // warn mirrors console.warn (stderr, no timestamp).
@@ -161,15 +179,26 @@ func Load(args []string) *Config {
 		port = 8082
 	}
 
+	// Empty-turn retry budget: clamped to 0-5 (a loop beyond that means the
+	// upstream is wedged; more retries only burn tokens).
+	emptyTurnRetries := parseInt(getArg("empty-turn-retries", "2"))
+	if emptyTurnRetries < 0 || emptyTurnRetries > 5 {
+		warn("Invalid --empty-turn-retries %d (must be between 0 and 5); using 2", emptyTurnRetries)
+		emptyTurnRetries = 2
+	}
+
 	return &Config{
-		UpstreamBaseURL: getArg("upstream-base-url", "https://api.openai.com/v1"),
-		UpstreamAPIKey:  getArg("upstream-api-key", ""),
-		AuthToken:       getArg("auth-token", ""),
-		Port:            port,
-		EnableThinking:  getBool("enable-thinking", true),
-		DumpDir:         getArg("dump", ""),
-		ModelOverrides:  modelOverrides,
-		ServerTools:     serverTools,
+		UpstreamBaseURL:         getArg("upstream-base-url", "https://api.openai.com/v1"),
+		UpstreamAPIKey:          getArg("upstream-api-key", ""),
+		AuthToken:               getArg("auth-token", ""),
+		Port:                    port,
+		EnableThinking:          getBool("enable-thinking", true),
+		DumpDir:                 getArg("dump", ""),
+		ModelOverrides:          modelOverrides,
+		ServerTools:             serverTools,
+		SanitizeClientMetaTurns: getBool("sanitize-client-meta-turns", true),
+		EmptyTurnGuard:          getBool("empty-turn-guard", true),
+		EmptyTurnMaxRetries:     emptyTurnRetries,
 	}
 }
 

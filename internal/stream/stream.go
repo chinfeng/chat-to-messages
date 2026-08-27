@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"os"
 	"strings"
 
 	"github.com/chinfeng/chat-to-messages/internal/convert"
@@ -60,6 +61,24 @@ type Options struct {
 	// downstream-initiated; the route's cancel() path owns that label). When
 	// omitted, upstream-termination reporting is skipped entirely.
 	IsDownstreamAborted func() bool
+	// InvisibleTurnRetry, when non-nil, arms the empty-turn guard: when a
+	// turn ends with reasoning but NO visible text and NO tool call while
+	// finishing cleanly (finish_reason absent/"stop"), the hook is invoked
+	// with the abandoned turn's content and the returned chunk sequence is
+	// appended to the SAME downstream message (fresh content blocks, block
+	// indices continuing; see emptyTurnGuard logic in finalize). Returning a
+	// nil sequence disables further retries. GO-ONLY EXTENSION: the TS
+	// reference streams one response verbatim; this guards kimi/GLM-family
+	// collapse where the model states its intent inside <think> and then
+	// abandons the turn with no tool call (dumped 2026-08-27).
+	InvisibleTurnRetry func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk]
+}
+
+// InvisibleTurnInfo snapshots an abandoned invisible turn for the
+// InvisibleTurnRetry hook.
+type InvisibleTurnInfo struct {
+	Reasoning   string // accumulated reasoning (<think>) text
+	VisibleText string // accumulated visible text (whitespace-only for an invisible turn)
 }
 
 // ExtractUsageInfo mirrors the TS extractUsageInfo(): Anthropic-compatible
@@ -200,129 +219,152 @@ func (s *Streamer) run(yield func(string) bool) {
 		s.handleError(emit, loopErr)
 		return
 	}
-	s.finalize(emit)
+	s.finalize(emit, &stop)
+}
+
+// processChunk handles one upstream chunk. done reports a [DONE] sentinel
+// (the sequence should stop consuming; the finish-reason classification that
+// follows still applies). err is the terminal stream error to route through
+// handleError.
+func (s *Streamer) processChunk(emit func(string), chunk openai.Chunk) (done bool, err error) {
+	// Read errors surface as a final chunk carrying the error
+	// (equivalent to the TS iterUpstreamChunks throw).
+	if chunk.Err != nil {
+		return false, &UpstreamAbortedError{
+			Message: "Connection closed mid-response. The response above may be incomplete.",
+			Subtype: "connection_closed",
+		}
+	}
+	// OpenAI stream-end marker: [DONE] is an explicit completion signal
+	// even when no finish_reason chunk arrived.
+	if chunk.Done {
+		s.seenDone = true
+		return true, nil
+	}
+	if chunk.Usage != nil {
+		s.usageInfo = chunk.Usage
+		// TS spread semantics (`{...first, ...extract(chunk.usage)}`):
+		// extractUsageInfo always returns all four buckets (0 for absent
+		// fields), so the fresh extraction replaces the previous usage
+		// wholesale — a later bare usage chunk wipes earlier cache
+		// buckets. User ruling 2026-08-03 (follow TS).
+		if u := ExtractUsageInfo(chunk.Usage); u != nil {
+			s.builder.SetUsage(*u)
+		}
+	}
+	// Detect upstream error objects embedded in the SSE stream.
+	if chunk.Error != nil {
+		// TS stream.ts: `const code = typeof err.code === "number" ? err.code : 500`.
+		// Error.Code is nil for non-numeric string codes (e.g. "E429") and
+		// missing codes, so both fall back to 500 here.
+		code := int64(500)
+		if chunk.Error.Code != nil {
+			code = *chunk.Error.Code
+		}
+		msg := chunk.Error.Message
+		if msg == "" {
+			msg = fmt.Sprintf("upstream error %d", code)
+		}
+		return false, &UpstreamStreamError{Message: "Server error mid-response. The response above may be incomplete. (upstream: " + msg + ")", Code: code}
+	}
+	if len(chunk.Choices) == 0 {
+		return false, nil
+	}
+	choice := chunk.Choices[0]
+	delta := choice.Delta
+	if delta == nil {
+		return false, nil
+	}
+	if choice.FinishReason != nil && *choice.FinishReason != "" {
+		s.finishReason = *choice.FinishReason
+	}
+
+	// Handle reasoning_content (thinking).
+	if s.thinkingEnabled && delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
+		for _, ev := range s.builder.EnsureThinkingBlock() {
+			emit(ev)
+		}
+		emit(s.builder.EmitThinkingDelta(*delta.ReasoningContent))
+	}
+
+	// Handle refusal delta — forwarded as text content so the client
+	// sees it (refusal supersedes other delta fields in this chunk).
+	if delta.Refusal != nil && *delta.Refusal != "" {
+		s.ensureTextBlock(emit)
+		emit(s.builder.TextDelta(*delta.Refusal))
+		return false, nil
+	}
+
+	// Handle text content.
+	if delta.Content != nil && *delta.Content != "" {
+		for _, part := range s.thinkParser.Feed(*delta.Content) {
+			if part.Type == parsers.ThinkingContent {
+				if !s.thinkingEnabled {
+					continue
+				}
+				for _, ev := range s.builder.EnsureThinkingBlock() {
+					emit(ev)
+				}
+				emit(s.builder.EmitThinkingDelta(part.Content))
+			} else {
+				filteredText, detectedTools := s.heuristicParser.Feed(part.Content)
+				if filteredText != "" {
+					s.ensureTextBlock(emit)
+					emit(s.builder.TextDelta(filteredText))
+				}
+				for _, toolUse := range detectedTools {
+					s.iterHeuristicToolUseSse(emit, toolUse)
+				}
+			}
+		}
+	}
+
+	// Handle native tool calls (accumulate args for JSON repair later).
+	if len(delta.ToolCalls) > 0 {
+		heuristicText, heuristicTools := s.heuristicParser.Flush()
+		if heuristicText != "" {
+			s.ensureTextBlock(emit)
+			emit(s.builder.TextDelta(heuristicText))
+		}
+		for _, toolUse := range heuristicTools {
+			s.iterHeuristicToolUseSse(emit, toolUse)
+		}
+		for _, ev := range s.builder.CloseContentBlocks() {
+			emit(ev)
+		}
+		for _, tc := range delta.ToolCalls {
+			if tc.Function.Arguments != nil && *tc.Function.Arguments != "" {
+				s.toolArgAccum[tc.Index] += *tc.Function.Arguments
+			}
+			s.processToolCall(emit, tc)
+		}
+	}
+	return false, nil
+}
+
+// consumeSequence drains one upstream chunk sequence through processChunk,
+// stopping early on [DONE], an error, or downstream abort (stop set by emit's
+// failed yield, checked here between chunks exactly like iterate did).
+func (s *Streamer) consumeSequence(seq iter.Seq[openai.Chunk], emit func(string), stop *bool) (err error) {
+	for chunk := range seq {
+		if stop != nil && *stop {
+			return nil
+		}
+		done, err := s.processChunk(emit, chunk)
+		if err != nil || done {
+			return err
+		}
+	}
+	return nil
 }
 
 // iterate is the for-await loop (TS try block). Returns nil on graceful end
 // (including a [DONE]-terminated stream), or the error to route through
 // handleError.
 func (s *Streamer) iterate(emit func(string), stop *bool) error {
-	for chunk := range s.chunks {
-		if *stop {
-			return nil
-		}
-		// Read errors surface as a final chunk carrying the error
-		// (equivalent to the TS iterUpstreamChunks throw).
-		if chunk.Err != nil {
-			return &UpstreamAbortedError{
-				Message: "Connection closed mid-response. The response above may be incomplete.",
-				Subtype: "connection_closed",
-			}
-		}
-		// OpenAI stream-end marker: [DONE] is an explicit completion signal
-		// even when no finish_reason chunk arrived.
-		if chunk.Done {
-			s.seenDone = true
-			break
-		}
-		if chunk.Usage != nil {
-			s.usageInfo = chunk.Usage
-			// TS spread semantics (`{...first, ...extract(chunk.usage)}`):
-			// extractUsageInfo always returns all four buckets (0 for absent
-			// fields), so the fresh extraction replaces the previous usage
-			// wholesale — a later bare usage chunk wipes earlier cache
-			// buckets. User ruling 2026-08-03 (follow TS).
-			if u := ExtractUsageInfo(chunk.Usage); u != nil {
-				s.builder.SetUsage(*u)
-			}
-		}
-		// Detect upstream error objects embedded in the SSE stream.
-		if chunk.Error != nil {
-			// TS stream.ts: `const code = typeof err.code === "number" ? err.code : 500`.
-			// Error.Code is nil for non-numeric string codes (e.g. "E429") and
-			// missing codes, so both fall back to 500 here.
-			code := int64(500)
-			if chunk.Error.Code != nil {
-				code = *chunk.Error.Code
-			}
-			msg := chunk.Error.Message
-			if msg == "" {
-				msg = fmt.Sprintf("upstream error %d", code)
-			}
-			return &UpstreamStreamError{Message: "Server error mid-response. The response above may be incomplete. (upstream: " + msg + ")", Code: code}
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		choice := chunk.Choices[0]
-		delta := choice.Delta
-		if delta == nil {
-			continue
-		}
-		if choice.FinishReason != nil && *choice.FinishReason != "" {
-			s.finishReason = *choice.FinishReason
-		}
-
-		// Handle reasoning_content (thinking).
-		if s.thinkingEnabled && delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
-			for _, ev := range s.builder.EnsureThinkingBlock() {
-				emit(ev)
-			}
-			emit(s.builder.EmitThinkingDelta(*delta.ReasoningContent))
-		}
-
-		// Handle refusal delta — forwarded as text content so the client
-		// sees it (refusal supersedes other delta fields in this chunk).
-		if delta.Refusal != nil && *delta.Refusal != "" {
-			s.ensureTextBlock(emit)
-			emit(s.builder.TextDelta(*delta.Refusal))
-			continue
-		}
-
-		// Handle text content.
-		if delta.Content != nil && *delta.Content != "" {
-			for _, part := range s.thinkParser.Feed(*delta.Content) {
-				if part.Type == parsers.ThinkingContent {
-					if !s.thinkingEnabled {
-						continue
-					}
-					for _, ev := range s.builder.EnsureThinkingBlock() {
-						emit(ev)
-					}
-					emit(s.builder.EmitThinkingDelta(part.Content))
-				} else {
-					filteredText, detectedTools := s.heuristicParser.Feed(part.Content)
-					if filteredText != "" {
-						s.ensureTextBlock(emit)
-						emit(s.builder.TextDelta(filteredText))
-					}
-					for _, toolUse := range detectedTools {
-						s.iterHeuristicToolUseSse(emit, toolUse)
-					}
-				}
-			}
-		}
-
-		// Handle native tool calls (accumulate args for JSON repair later).
-		if len(delta.ToolCalls) > 0 {
-			heuristicText, heuristicTools := s.heuristicParser.Flush()
-			if heuristicText != "" {
-				s.ensureTextBlock(emit)
-				emit(s.builder.TextDelta(heuristicText))
-			}
-			for _, toolUse := range heuristicTools {
-				s.iterHeuristicToolUseSse(emit, toolUse)
-			}
-			for _, ev := range s.builder.CloseContentBlocks() {
-				emit(ev)
-			}
-			for _, tc := range delta.ToolCalls {
-				if tc.Function.Arguments != nil && *tc.Function.Arguments != "" {
-					s.toolArgAccum[tc.Index] += *tc.Function.Arguments
-				}
-				s.processToolCall(emit, tc)
-			}
-		}
+	err := s.consumeSequence(s.chunks, emit, stop)
+	if err != nil {
+		return err
 	}
 
 	// No finish_reason chunk was seen: [DONE] means graceful completion
@@ -394,10 +436,69 @@ func (s *Streamer) handleError(emit func(string), loopErr error) {
 	s.err = loopErr
 }
 
+// isInvisibleStopTurn reports the empty-turn-collapse signature: a cleanly
+// finished turn ("stop" or an implicit stop via [DONE]) with reasoning
+// content but no visible text and no tool call. A text-less end_turn makes
+// the downstream agent loop stop without any progress.
+func (s *Streamer) isInvisibleStopTurn() bool {
+	if s.finishReason != "" && s.finishReason != "stop" {
+		return false
+	}
+	if s.builder.HasEmittedToolBlock() {
+		return false
+	}
+	if strings.TrimSpace(s.builder.AccumulatedText()) != "" {
+		return false
+	}
+	return strings.TrimSpace(s.builder.AccumulatedReasoning()) != ""
+}
+
+// emptyTurnGuard consumes retry sequences while the turn still matches the
+// invisible collapse signature. Each attempt's chunks continue the SAME
+// downstream message: open blocks are closed (thinking keeps its signature)
+// before the first attempt, and continuation attempts stream fresh blocks
+// with subsequent indices. Accumulators keep growing across attempts, so the
+// invisible re-check covers all attempts combined. The hook enforces its own
+// budget by returning a nil sequence. Retry failures are swallowed — the
+// baseline invisible-turn finalize below still produces a protocol-valid
+// end of message.
+//
+// Tool-index safety: an invisible turn by definition emitted zero tool_calls,
+// so toolArgAccum/tool state maps are empty for every index a retry uses —
+// retried indexes cannot collide with stale state.
+func (s *Streamer) emptyTurnGuard(emit func(string), stop *bool) {
+	if s.opts == nil || s.opts.InvisibleTurnRetry == nil {
+		return
+	}
+	for attempt := 1; ; attempt++ {
+		if !s.isInvisibleStopTurn() {
+			return
+		}
+		seq := s.opts.InvisibleTurnRetry(attempt, InvisibleTurnInfo{
+			Reasoning:   s.builder.AccumulatedReasoning(),
+			VisibleText: s.builder.AccumulatedText(),
+		})
+		if seq == nil {
+			return
+		}
+		// Close open blocks (with thinking signature) so the continuation
+		// opens fresh blocks instead of appending into the abandoned one.
+		for _, ev := range s.builder.CloseContentBlocks() {
+			emit(ev)
+		}
+		if err := s.consumeSequence(seq, emit, stop); err != nil || *stop {
+			// A retry-level failure degrades to the invisible-turn fallback:
+			// better a valid empty end_turn than a corrupt SSE sequence.
+			fmt.Fprintln(os.Stderr, "chat-to-messages: empty-turn guard retry failed:", err)
+			return
+		}
+	}
+}
+
 // finalize is the normal post-loop flush (TS lines after the try/catch):
-// parser flushes, orphaned tool resolution, empty-content placeholder,
-// task-args flush, block close, and the terminal message events.
-func (s *Streamer) finalize(emit func(string)) {
+// parser flushes, orphaned tool resolution, empty-turn guard, empty-content
+// placeholder, task-args flush, block close, and the terminal message events.
+func (s *Streamer) finalize(emit func(string), stop *bool) {
 	if remaining := s.thinkParser.Flush(); remaining != nil {
 		if remaining.Type == parsers.ThinkingContent {
 			if s.thinkingEnabled {
@@ -472,6 +573,10 @@ func (s *Streamer) finalize(emit func(string)) {
 			s.builder.DeleteToolState(toolIndex)
 		}
 	}
+
+	// Empty-turn guard: offer bounded upstream retries before declaring the
+	// turn invisible below (TS parity preserved when no hook is armed).
+	s.emptyTurnGuard(emit, stop)
 
 	// Ensure at least one content block exists.
 	hasStartedTool := s.builder.HasEmittedToolBlock()

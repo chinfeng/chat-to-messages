@@ -349,3 +349,42 @@ func TestResolveModelExtraFullOverrides(t *testing.T) {
 		t.Errorf("nil overrides: %v", got)
 	}
 }
+
+// ---- sanitize / empty-turn guard config (Go-only extension) ----
+
+func TestLoadGuardDefaults(t *testing.T) {
+	cfg := Load(nil)
+	if !cfg.SanitizeClientMetaTurns {
+		t.Error("SanitizeClientMetaTurns should default true")
+	}
+	if !cfg.EmptyTurnGuard {
+		t.Error("EmptyTurnGuard should default true")
+	}
+	if cfg.EmptyTurnMaxRetries != 2 {
+		t.Errorf("EmptyTurnMaxRetries = %d", cfg.EmptyTurnMaxRetries)
+	}
+}
+
+func TestLoadGuardFlags(t *testing.T) {
+	cfg := Load([]string{
+		"--no-sanitize-client-meta-turns",
+		"--no-empty-turn-guard",
+	})
+	if cfg.SanitizeClientMetaTurns {
+		t.Error("--no-sanitize-client-meta-turns ignored")
+	}
+	if cfg.EmptyTurnGuard {
+		t.Error("--no-empty-turn-guard ignored")
+	}
+}
+
+func TestLoadEmptyTurnRetriesClamp(t *testing.T) {
+	cfg := Load([]string{"--empty-turn-retries", "9"})
+	if cfg.EmptyTurnMaxRetries != 2 {
+		t.Errorf("out-of-range retries = %d, want clamped 2", cfg.EmptyTurnMaxRetries)
+	}
+	cfg = Load([]string{"--empty-turn-retries=0"})
+	if cfg.EmptyTurnMaxRetries != 0 {
+		t.Errorf("zero retries = %d", cfg.EmptyTurnMaxRetries)
+	}
+}

@@ -56,6 +56,88 @@ var sigMarkerRe = regexp.MustCompile(`<!--sig:[0-9a-f]{64}-->`)
 // corrupts the arguments the model streams back to Claude Code.
 var interruptMarkerRe = regexp.MustCompile(`\[Tool use interrupted\]|No result from invoke\.`)
 
+// Claude Code injects synthetic USER-side meta turns into /v1/messages
+// requests when recovering from degenerate replies (dumped 2026-08-27,
+// kimi-k3 session):
+//
+//   - "[Your previous response had no visible output. …]" after a
+//     thinking-only reply,
+//   - "(no content)" placeholder turns,
+//   - the literal interruption markers on either side.
+//
+// Replayed verbatim upstream they are imitation poison: the model reads a
+// history where its own tool calls vanish unanswered and it is repeatedly
+// told its output was invisible, then reproduces exactly that shape
+// (thinking-only / whitespace replies, intent-stating text with no tool call)
+// until the agent loop dies. Same failure class as the sig-marker incident
+// below.
+//
+// Unlike the ASSISTANT-side scrubbing (pure client rendering artifacts),
+// these user turns ARE deliberately addressed to the model, so they are not
+// deleted — deleting would change the message shape some strict upstreams
+// reject (assistant-last histories). Instead an ENTIRE turn whose content
+// (string, or an all-text block list) equals one of these markers, modulo
+// surrounding whitespace, is normalized to a deterministic, accusation-free
+// continuation cue with identical intent.
+//
+// INTENTIONAL TS DEVIATION (port ruling 2026-08-27): the TS reference has no
+// equivalent; this protects weak upstream models from client recovery-loop
+// context poisoning. Exact-match only — free-form user prose is never
+// touched.
+const (
+	metaNoVisibleOutputMarker   = "[your previous response had no visible output. please continue and produce a user-visible response.]"
+	metaNoContentMarker         = "(no content)"
+	metaInterruptedMarker       = "[request interrupted by user]"
+	metaInterruptedForToolUse   = "[request interrupted by user for tool use]"
+	metaVisibleOutputContinuation = "Your previous turn ended without any visible output. Continue your task now: reply with text and/or the needed tool calls."
+	metaPlainContinuation       = "Continue."
+)
+
+// userMetaTurnReplacement returns the normalized replacement text when text is
+// (a whitespace-insensitive) exact match for a Claude Code synthetic user meta
+// turn, and "" with ok=false otherwise.
+func userMetaTurnReplacement(text string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case metaNoVisibleOutputMarker:
+		return metaVisibleOutputContinuation, true
+	case metaNoContentMarker, metaInterruptedMarker, metaInterruptedForToolUse:
+		return metaPlainContinuation, true
+	}
+	return "", false
+}
+
+// SanitizeUserMetaTurn normalizes the content value of a USER message when
+// the entire content is a synthetic Claude Code meta turn (see the constant
+// block above). ok reports a replacement; unchanged values pass through with
+// ok=false. Only string contents and all-text block lists participate;
+// anything containing tool_result/image/thinking blocks never matches.
+func SanitizeUserMetaTurn(content anthropic.ContentValue, enabled bool) (anthropic.ContentValue, bool) {
+	if !enabled {
+		return content, false
+	}
+	if content.IsString {
+		if repl, ok := userMetaTurnReplacement(content.Str); ok {
+			return anthropic.ContentValue{IsString: true, Str: repl}, true
+		}
+		return content, false
+	}
+	if len(content.BlocksVal) == 0 {
+		return content, false
+	}
+	var parts []string
+	for i := range content.BlocksVal {
+		b := &content.BlocksVal[i]
+		if b.Type != "text" {
+			return content, false
+		}
+		parts = append(parts, b.Text)
+	}
+	if repl, ok := userMetaTurnReplacement(strings.Join(parts, "\n")); ok {
+		return anthropic.ContentValue{IsString: true, Str: repl}, true
+	}
+	return content, false
+}
+
 // scrubSigMarkers removes signature markers from assistant text replayed
 // upstream (both legacy injected ones and model-mimicked echoes).
 func scrubSigMarkers(text string) string {
@@ -692,7 +774,11 @@ func buildImagePartFromMap(block map[string]any) map[string]any {
 // deferred post-tool state machine (PendingAfterTools) is ported as-is. Like
 // the TS throw, an image block on the user-injection path surfaces as an
 // *OpenAIConversionError.
-func ConvertMessages(messages []anthropic.Message, reasoningReplay ReasoningReplayMode) ([]map[string]any, error) {
+//
+// sanitizeMetaTurns enables normalization of synthetic Claude Code user meta
+// turns (see SanitizeUserMetaTurn) — an intentional TS deviation gated by the
+// --sanitize-client-meta-turns config.
+func ConvertMessages(messages []anthropic.Message, reasoningReplay ReasoningReplayMode, sanitizeMetaTurns bool) ([]map[string]any, error) {
 	if reasoningReplay == "" {
 		reasoningReplay = ReplayThinkTags // TS default parameter
 	}
@@ -701,6 +787,19 @@ func ConvertMessages(messages []anthropic.Message, reasoningReplay ReasoningRepl
 
 	for mi := range messages {
 		msg := &messages[mi]
+
+		// User meta-turn normalization is copy-on-write: patching msg in place
+		// would mutate the caller's request slice (BuildBaseRequestBody shares
+		// req.Messages with the Anthropic handler), so the slice is copied once
+		// on the first hit.
+		if sanitizeMetaTurns && msg.Role == "user" {
+			if sanitized, changed := SanitizeUserMetaTurn(msg.Content, true); changed {
+				messages = append([]anthropic.Message(nil), messages...)
+				msg = &messages[mi]
+				msg.Content = sanitized
+			}
+		}
+
 		reasoningContent, hasReasoning := cleanReasoningContent(msg.ReasoningContent)
 
 		str, isString := msg.Content.String()
@@ -900,6 +999,11 @@ type RequestData struct {
 	Tools         []map[string]any
 	ToolChoice    any
 	ServerTools   []map[string]any
+
+	// SanitizeClientMetaTurns is not part of the TS interface: it gates the
+	// Go-only user meta-turn normalization (proxy config
+	// --sanitize-client-meta-turns). See SanitizeUserMetaTurn.
+	SanitizeClientMetaTurns bool
 }
 
 // BuildBaseRequestBody mirrors buildBaseRequestBody() in converter.ts.
@@ -908,7 +1012,7 @@ type RequestData struct {
 // (type, name), and re-exposed as OpenAI function schemas plus a system
 // prompt suffix.
 func BuildBaseRequestBody(req *RequestData, defaultMaxTokens any, reasoningReplay ReasoningReplayMode) (map[string]any, error) {
-	messages, err := ConvertMessages(req.Messages, reasoningReplay)
+	messages, err := ConvertMessages(req.Messages, reasoningReplay, req.SanitizeClientMetaTurns)
 	if err != nil {
 		return nil, err
 	}

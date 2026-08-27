@@ -43,7 +43,7 @@ func jsonStr(t *testing.T, v any) string {
 
 func convert(t *testing.T, msgs []anthropic.Message, replay ReasoningReplayMode) []map[string]any {
 	t.Helper()
-	got, err := ConvertMessages(msgs, replay)
+	got, err := ConvertMessages(msgs, replay, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -919,7 +919,7 @@ func TestConvertUserImageWithPendingErrors(t *testing.T) {
 			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}}
 		]}
 	]`)
-	_, err := ConvertMessages(msgs, ReplayThinkTags)
+	_, err := ConvertMessages(msgs, ReplayThinkTags, false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1170,5 +1170,120 @@ func TestEstimateInputTokensCounts(t *testing.T) {
 	// 6 + (3+2+1+1+4) + (1+4) = 22
 	if got := EstimateInputTokens(msgs); got != 22 {
 		t.Errorf("got %d", got)
+	}
+}
+
+// ---- user meta-turn sanitization (Go-only extension, dumped 2026-08-27) ----
+
+func TestSanitizeUserMetaTurnStringMatches(t *testing.T) {
+	marker := "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+	got, changed := SanitizeUserMetaTurn(anthropic.ContentValue{IsString: true, Str: marker}, true)
+	if !changed || !got.IsString || got.Str != metaVisibleOutputContinuation {
+		t.Fatalf("changed=%v got=%+v", changed, got)
+	}
+}
+
+func TestSanitizeUserMetaTurnTrimsAndCaseFolds(t *testing.T) {
+	got, changed := SanitizeUserMetaTurn(anthropic.ContentValue{IsString: true, Str: "  (No Content)\n"}, true)
+	if !changed || got.Str != metaPlainContinuation {
+		t.Fatalf("changed=%v got=%+v", changed, got)
+	}
+}
+
+func TestSanitizeUserMetaTurnBlocksForm(t *testing.T) {
+	// CC sends the nudge as a single text block carrying cache_control in
+	// Extra; the block list form must normalize identically.
+	content := anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+		{Type: "text", Text: "(no content)", Extra: map[string]any{"cache_control": map[string]any(nil)}},
+	}}
+	got, changed := SanitizeUserMetaTurn(content, true)
+	if !changed || !got.IsString || got.Str != metaPlainContinuation {
+		t.Fatalf("changed=%v got=%+v", changed, got)
+	}
+}
+
+func TestSanitizeUserMetaTurnLeavesRealContentAlone(t *testing.T) {
+	cases := []anthropic.ContentValue{
+		{IsString: true, Str: "please fix the login bug (no content later)"},
+		{IsString: true, Str: ""},
+		{BlocksVal: []anthropic.ContentBlock{{Type: "tool_result", ToolUseID: "t", Content: json.RawMessage(`"x"`)}}},
+	}
+	for i, c := range cases {
+		if _, changed := SanitizeUserMetaTurn(c, true); changed {
+			t.Fatalf("case %d was rewritten", i)
+		}
+	}
+}
+
+func TestSanitizeUserMetaTurnDisabled(t *testing.T) {
+	marker := "[Request interrupted by user]"
+	if _, changed := SanitizeUserMetaTurn(anthropic.ContentValue{IsString: true, Str: marker}, false); changed {
+		t.Fatal("disabled flag must not rewrite")
+	}
+}
+
+func TestConvertMessagesSanitizesAndKeepsCallerSlice(t *testing.T) {
+	msgs := []anthropic.Message{
+		{Role: "user", Content: anthropic.ContentValue{Str: "(no content)", IsString: true}},
+		{Role: "assistant", Content: anthropic.ContentValue{Str: "<think>plan</think>"}},
+		{Role: "user", Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "[Your previous response had no visible output. Please continue and produce a user-visible response.]"},
+		}}},
+	}
+	before := append([]anthropic.Message(nil), msgs...)
+
+	out, err := ConvertMessages(msgs, ReplayThinkTags, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var texts []string
+	for _, m := range out {
+		if m["role"] != "user" {
+			continue
+		}
+		if s, ok := m["content"].(string); ok {
+			texts = append(texts, s)
+		}
+	}
+	want := metaPlainContinuation + "\n" + metaVisibleOutputContinuation
+	if strings.Join(texts, "\n") != want {
+		t.Fatalf("user turns = %#v", texts)
+	}
+	// Copy-on-write: the caller's request slice must be untouched.
+	for i := range msgs {
+		gotS, _ := msgs[i].Content.String()
+		wantS, _ := before[i].Content.String()
+		if gotS != wantS || len(msgs[i].Content.BlocksVal) != len(before[i].Content.BlocksVal) {
+			t.Fatalf("caller slice mutated at %d", i)
+		}
+	}
+}
+
+func TestBuildBaseRequestBodyThreadsSanitizeFlag(t *testing.T) {
+	newReq := func(enabled bool) *RequestData {
+		return &RequestData{
+			Model: "m",
+			Messages: []anthropic.Message{
+				{Role: "user", Content: anthropic.ContentValue{Str: "(no content)", IsString: true}},
+			},
+			SanitizeClientMetaTurns: enabled,
+		}
+	}
+	bodyOn, err := BuildBaseRequestBody(newReq(true), 100, ReplayThinkTags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastOn := bodyOn["messages"].([]any)[0].(map[string]any)["content"]
+	if lastOn != metaPlainContinuation {
+		t.Fatalf("sanitized request kept marker: %v", lastOn)
+	}
+
+	bodyOff, err := BuildBaseRequestBody(newReq(false), 100, ReplayThinkTags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastOff := bodyOff["messages"].([]any)[0].(map[string]any)["content"]
+	if lastOff != "(no content)" {
+		t.Fatalf("unsanitized request altered content: %v", lastOff)
 	}
 }

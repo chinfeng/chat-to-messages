@@ -135,6 +135,9 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--port` | `8082` | HTTP 监听端口 |
 | `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
 | `--no-enable-thinking` | — | 禁用 thinking 转换 |
+| `--sanitize-client-meta-turns` | `true` | 将 Claude Code 注入的合成用户轮（`[Your previous response had no visible output...]`、`(no content)`、中断标记）规约为中性续作指令后再重放给上游模型 |
+| `--empty-turn-guard` | `true` | 空回合守卫：回合以推理结束但既无可见文本也无工具调用时，自动向上游发起有界重试（针对 kimi-k3/GLM 塌方模式） |
+| `--empty-turn-retries` | `2` | 每个请求允许的空回合重试次数上限（0-5） |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
 | `--enable-web-search` | `false` | 启用代理端 Web 搜索 |

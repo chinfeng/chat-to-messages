@@ -1039,3 +1039,137 @@ func TestStreamUsageEstimateFallback(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 func int64Ptr(i int64) *int64 { return &i }
+
+// ---- empty-turn guard (Go-only extension, dumped 2026-08-27) ----
+
+const guardInvisibleSSE = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I will read routes.ts now\"}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+const guardRecoverySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"Reading the TTL constants.\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"Read:0\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"x\\\"}\"}}]}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+func TestStreamEmptyTurnGuardRetriesAndContinues(t *testing.T) {
+	chunks := chunksFromSSE(t, guardInvisibleSSE)
+	recovery := chunksFromSSE(t, guardRecoverySSE)
+	calls := 0
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, &Options{
+		InvisibleTurnRetry: func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+			calls++
+			if attempt != 1 || calls != 1 {
+				t.Fatalf("unexpected call attempt=%d calls=%d", attempt, calls)
+			}
+			if info.Reasoning != "I will read routes.ts now" {
+				t.Fatalf("info.Reasoning = %q", info.Reasoning)
+			}
+			return seqFromSlice(recovery)
+		},
+	})
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(events, "")
+	if !strings.Contains(all, "Reading the TTL constants.") {
+		t.Fatal("retry continuation text missing")
+	}
+	if strings.Contains(all, `"text":" "`) {
+		t.Fatal("placeholder space emitted despite real retry content")
+	}
+	if strings.Count(strings.Join(eventTypes(events), ","), "message_delta") != 1 {
+		t.Fatalf("lifecycle events duplicated: %v", eventTypes(events))
+	}
+	if !strings.Contains(events[len(events)-2], `"stop_reason":"tool_use"`) {
+		t.Fatalf("final delta = %s", events[len(events)-2])
+	}
+}
+
+func TestStreamEmptyTurnGuardExhaustedFallsBack(t *testing.T) {
+	chunks := chunksFromSSE(t, guardInvisibleSSE)
+	stillInvisible := chunksFromSSE(t, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n"+
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	var calls int
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, &Options{
+		InvisibleTurnRetry: func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+			calls++
+			if attempt == 1 {
+				return seqFromSlice(stillInvisible)
+			}
+			return nil
+		},
+	})
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d", calls)
+	}
+	all := strings.Join(events, "")
+	if !strings.Contains(all, "still thinking") {
+		t.Fatal("first retry reasoning missing from stream")
+	}
+	// Baseline invisible finalize preserved: placeholder text + clean end_turn.
+	if !strings.Contains(all, `"text_delta","text":" "`) {
+		t.Fatal("baseline placeholder missing after exhausted retries")
+	}
+	if !strings.Contains(events[len(events)-2], `"stop_reason":"end_turn"`) {
+		t.Fatalf("final delta = %s", events[len(events)-2])
+	}
+}
+
+func TestStreamEmptyTurnGuardRetryErrorFallsBackCleanly(t *testing.T) {
+	chunks := chunksFromSSE(t, guardInvisibleSSE)
+	failing := []openai.Chunk{{Err: errors.New("boom")}}
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, &Options{
+		InvisibleTurnRetry: func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+			return seqFromSlice(failing)
+		},
+	})
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatalf("retry failure must not surface: %v", err)
+	}
+	if !strings.Contains(strings.Join(events, ""), `"text_delta","text":" "`) {
+		t.Fatal("fallback placeholder missing")
+	}
+}
+
+func TestStreamEmptyTurnGuardNotArmedKeepsTSParity(t *testing.T) {
+	chunks := chunksFromSSE(t, guardInvisibleSSE)
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, nil)
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(events, ""), `"text_delta","text":" "`) {
+		t.Fatal("placeholder missing without hook")
+	}
+}
+
+func TestStreamEmptyTurnGuardSkipsLengthFinish(t *testing.T) {
+	// A token-limit cut ("length") is the client's recovery path (thinking
+	// resumption / max-output-tokens recovery), never a collapse signature.
+	body := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial plan\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+	chunks := chunksFromSSE(t, body)
+	calls := 0
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil, &Options{
+		InvisibleTurnRetry: func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk] {
+			calls++
+			return nil
+		},
+	})
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("hook invoked %d times for length finish", calls)
+	}
+	if !strings.Contains(events[len(events)-2], `"stop_reason":"max_tokens"`) {
+		t.Fatalf("expected max_tokens mapping, got %s", events[len(events)-2])
+	}
+}

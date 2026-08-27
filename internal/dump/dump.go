@@ -108,6 +108,28 @@ func (s *Session) WriteUpstreamRequest(headers map[string]string, datetime, body
 	_ = os.WriteFile(filepath.Join(s.tmpDir, "upstream-request.log"), []byte(formatRequestLog(headers, datetime, body)), 0o644)
 }
 
+// WriteUpstreamAttemptRequest logs the request of an empty-turn-guard retry
+// attempt n (2-based: attempt 1 is the primary request already logged by
+// WriteUpstreamRequest). Numbered sibling files keep the full retry history
+// for forensics of this failure class.
+func (s *Session) WriteUpstreamAttemptRequest(n int, headers map[string]string, datetime, body string) {
+	if s.noop || n < 2 {
+		return
+	}
+	name := fmt.Sprintf("upstream-request-attempt-%d.log", n)
+	_ = os.WriteFile(filepath.Join(s.tmpDir, name), []byte(formatRequestLog(headers, datetime, body)), 0o644)
+}
+
+// WriteUpstreamAttemptResponse logs the response of an empty-turn-guard retry
+// attempt n (same numbering as WriteUpstreamAttemptRequest).
+func (s *Session) WriteUpstreamAttemptResponse(n int, headers map[string]string, status int, body string) {
+	if s.noop || n < 2 {
+		return
+	}
+	name := fmt.Sprintf("upstream-response-attempt-%d.log", n)
+	_ = os.WriteFile(filepath.Join(s.tmpDir, name), []byte(formatResponseLog(headers, status, body, nil, nil)), 0o644)
+}
+
 // WriteUpstreamResponse logs the upstream response. A non-nil termination
 // becomes the tracked downstream outcome.
 func (s *Session) WriteUpstreamResponse(headers map[string]string, status int, body string, termination *Termination) {

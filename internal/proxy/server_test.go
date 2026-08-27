@@ -1283,3 +1283,89 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+// ---- empty-turn guard end-to-end (Go-only extension) ----
+
+func TestEmptyTurnGuardRetriesUpstreamAndContinuesMessage(t *testing.T) {
+	const invisibleSSE = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I will read routes.ts now\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	const recoverySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"Reading the TTL constants.\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"Read:0\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"routes.ts\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+
+	mu := sync.Mutex{}
+	upstreamBodies := make(chan string, 2)
+	var upstreamRequestBodies []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		upstreamRequestBodies = append(upstreamRequestBodies, string(raw))
+		mu.Unlock()
+		body := <-upstreamBodies
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(up.Close)
+	upstreamBodies <- invisibleSSE
+	upstreamBodies <- recoverySSE
+
+	cfg := testConfig(up.URL)
+	cfg.EmptyTurnGuard = true
+	cfg.EmptyTurnMaxRetries = 2
+	h := NewHandler(cfg)
+
+	resp := postMessages(t, h,
+		`{"model":"kimi-k3","tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"investigate"}]}`,
+		nil)
+	defer resp.Body.Close()
+	events := parseSSE(t, mustReadAll(t, resp))
+	var lastDelta string
+	allText := ""
+	for _, e := range events {
+		if e.event == "message_delta" {
+			lastDelta = e.data
+		}
+		if strings.Contains(e.data, "text_delta") {
+			var d struct {
+				Delta struct{ Text string }
+			}
+			json.Unmarshal([]byte(e.data), &d)
+			allText += d.Delta.Text
+		}
+	}
+	if !strings.Contains(allText, "Reading the TTL constants.") {
+		t.Fatalf("retry text missing downstream: %q", allText)
+	}
+	if !strings.Contains(lastDelta, `"stop_reason":"tool_use"`) {
+		t.Fatalf("stop_reason not propagated from retry: %s", lastDelta)
+	}
+
+	// The retried upstream request must carry the abandoned assistant turn
+	// (think-tagged reasoning) plus the corrective cue, and exactly one retry
+	// (2 upstream requests total) must have happened.
+	mu.Lock()
+	nRequests := len(upstreamRequestBodies)
+	retryBody := upstreamRequestBodies[nRequests-1]
+	mu.Unlock()
+	if nRequests != 2 {
+		t.Fatalf("upstream request count = %d", nRequests)
+	}
+	for _, want := range []string{
+		`\u003cthink\u003e`, // canonical JSON escapes <
+		"I will read routes.ts now",
+		"Continue your task now",
+	} {
+		if !strings.Contains(retryBody, want) {
+			t.Fatalf("retry body missing %q:\n%s", want, retryBody)
+		}
+	}
+}
+
+func mustReadAll(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
