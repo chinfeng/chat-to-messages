@@ -202,6 +202,37 @@ func TestStreamThinkTagsDisabled(t *testing.T) {
 	}
 }
 
+// toolUseID extracts the id emitted by the single tool_use content_block_start
+// event, failing the test when absent or not exactly one.
+func toolUseID(t *testing.T, events []string) string {
+	t.Helper()
+	ids := []string{}
+	for _, e := range events {
+		for _, line := range strings.Split(e, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var ev struct {
+				Type         string `json:"type"`
+				ContentBlock struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+				} `json:"content_block"`
+			}
+			if err := json.Unmarshal([]byte(line[6:]), &ev); err != nil {
+				continue
+			}
+			if ev.Type == "content_block_start" && ev.ContentBlock.Type == "tool_use" {
+				ids = append(ids, ev.ContentBlock.ID)
+			}
+		}
+	}
+	if len(ids) != 1 {
+		t.Fatalf("want exactly 1 tool_use block, got %d (%v)", len(ids), ids)
+	}
+	return ids[0]
+}
+
 func TestStreamNativeToolCall(t *testing.T) {
 	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/etc/hosts\\\"}\"}}]}}]}\n\n" +
@@ -209,8 +240,15 @@ func TestStreamNativeToolCall(t *testing.T) {
 		"data: [DONE]\n\n"
 	ev := allEvents(t, body, req(t, "m1"))
 	joined := strings.Join(ev, "\n")
-	if !strings.Contains(joined, `"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}`) {
-		t.Errorf("tool start missing: %s", joined)
+	// The upstream id must NOT pass through: relays mint ids whose uniqueness
+	// resets per response, and Claude Code drops duplicate-id tool_use blocks
+	// across turns (dumped 2026-08-28, kimi-k3 Bash:0 doom loop).
+	if strings.Contains(joined, `"id":"call_1"`) {
+		t.Errorf("upstream id leaked downstream: %s", joined)
+	}
+	id := toolUseID(t, ev)
+	if !strings.HasPrefix(id, "toolu_") {
+		t.Errorf("tool id = %q, want toolu_ prefix", id)
 	}
 	if !strings.Contains(joined, `"partial_json":"{\"path\":\"`) {
 		t.Errorf("first delta missing: %s", joined)
@@ -220,6 +258,28 @@ func TestStreamNativeToolCall(t *testing.T) {
 	}
 	if !strings.Contains(joined, `"stop_reason":"tool_use"`) {
 		t.Errorf("stop reason: %s", joined)
+	}
+}
+
+// TestStreamToolIDUniqueAcrossResponses pins the duplicate-id defense: two
+// responses that both reuse the same upstream id ("Bash:0", the relay's
+// Name:index scheme) must surface distinct downstream ids, or Claude Code
+// drops the second tool_use and the turn degenerates into "(no content)"
+// recovery loop.
+func TestStreamToolIDUniqueAcrossResponses(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"Bash:0\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	var ids []string
+	for i := 0; i < 2; i++ {
+		ev := allEvents(t, body, req(t, "m1"))
+		id := toolUseID(t, ev)
+		if strings.Contains(id, "Bash:0") {
+			t.Errorf("upstream id leaked downstream: %q", id)
+		}
+		ids = append(ids, id)
+	}
+	if ids[0] == ids[1] {
+		t.Errorf("ids across responses collide: %v", ids)
 	}
 }
 

@@ -688,8 +688,16 @@ func (s *Streamer) processToolCall(emit func(string), tc openai.ToolCallDelta) {
 		args = *tc.Function.Arguments
 	}
 
-	if tcID != "" {
-		s.builder.SetStreamToolID(tcIndex, tcID)
+	if tcID != "" && s.builder.ToolID(tcIndex) == "" {
+		// Upstream ids must never pass through verbatim: relays in the wild
+		// mint "Name:index" ids whose index resets every response, so a
+		// repeated tool reuses the id of an earlier turn and Claude Code
+		// silently drops the duplicate-id tool_use block, recording the turn
+		// as empty (dumped 2026-08-28 — kimi-k3 Bash:0 doom loop). Ids are
+		// opaque downstream and tool_results echo whatever was issued here,
+		// so always issue a fresh unique one (once per tool index; later
+		// fragments of the same call repeat the id).
+		s.builder.SetStreamToolID(tcIndex, "toolu_"+uuidV4())
 	}
 	if tc.Function.Name != nil {
 		s.builder.RegisterToolName(tcIndex, fnName)
