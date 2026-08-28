@@ -478,6 +478,75 @@ func TestCORS(t *testing.T) {
 	}
 }
 
+// TestUpstreamReasoningReplayPerModel pins the per-model wiring of
+// --reasoning-replay through buildBaseBody: an assistant turn with thinking +
+// tool_use must reach the upstream as reasoning_content when the model matches
+// a rule, and as <think> text in content under the default think_tags mode
+// (the kimi-k3 contract vs. the GLM-family default).
+func TestUpstreamReasoningReplayPerModel(t *testing.T) {
+	downstreamBody := `{"model":"kimi-k3","messages":[` +
+		`{"role":"user","content":"hi"},` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"plan the call","signature":"sig"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"a"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`
+
+	capture := func(t *testing.T, cfg *config.Config) map[string]any {
+		t.Helper()
+		var gotBody map[string]any
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			json.Unmarshal(b, &gotBody)
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}}]}\n\ndata: [DONE]\n\n")
+		}))
+		defer up.Close()
+		cfg.UpstreamBaseURL = up.URL
+		resp := postMessages(t, NewHandler(cfg), downstreamBody, nil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		return gotBody
+	}
+
+	findToolCallMsg := func(t *testing.T, body map[string]any) map[string]any {
+		t.Helper()
+		msgs, _ := body["messages"].([]any)
+		for _, m := range msgs {
+			msg, _ := m.(map[string]any)
+			if role, _ := msg["role"].(string); role == "assistant" {
+				if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+					return msg
+				}
+			}
+		}
+		t.Fatalf("no assistant tool_calls message in upstream body: %v", body["messages"])
+		return nil
+	}
+
+	t.Run("rule matched sends reasoning_content", func(t *testing.T) {
+		cfg := testConfig("")
+		cfg.ReasoningReplayRules = []config.ReasoningReplayRule{
+			{Pattern: "kimi*", Mode: config.ReplayModeReasoningContent},
+		}
+		msg := findToolCallMsg(t, capture(t, cfg))
+		if rc, _ := msg["reasoning_content"].(string); rc != "plan the call" {
+			t.Errorf("reasoning_content = %v, want %q", msg["reasoning_content"], "plan the call")
+		}
+		if content, _ := msg["content"].(string); strings.Contains(content, "<think>") {
+			t.Errorf("content leaked <think> markup: %q", content)
+		}
+	})
+
+	t.Run("default keeps think_tags", func(t *testing.T) {
+		msg := findToolCallMsg(t, capture(t, testConfig("")))
+		if _, ok := msg["reasoning_content"]; ok {
+			t.Errorf("reasoning_content unexpectedly present: %v", msg["reasoning_content"])
+		}
+		if content, _ := msg["content"].(string); !strings.Contains(content, "<think>") {
+			t.Errorf("content missing <think> markup: %q", content)
+		}
+	})
+}
+
 func TestDumpWiring(t *testing.T) {
 	upstreamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}}]}\n\n" +

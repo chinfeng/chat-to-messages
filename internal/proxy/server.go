@@ -247,7 +247,13 @@ func applyIncludeUsage(body map[string]any) {
 // steps of buildUpstreamRequest() in routes.ts): base body, stream: true,
 // model extra merged, include_usage applied, canonicalized.
 func buildBaseBody(cfg *config.Config, requestData *convert.RequestData) (map[string]any, error) {
-	body, err := convert.BuildBaseRequestBody(requestData, 4096, convert.ReplayThinkTags)
+	// Replay mode is per-model: kimi-k3 requires assistant tool-call turns to
+	// carry reasoning_content when thinking is enabled, while think_tags is
+	// the native representation for GLM-family upstreams and DeepSeek rejects
+	// reasoning_content in input messages outright.
+	replayMode := convert.ReasoningReplayMode(config.ResolveReasoningReplay(
+		requestData.Model, cfg.ReasoningReplayRules, cfg.DefaultReasoningReplay))
+	body, err := convert.BuildBaseRequestBody(requestData, 4096, replayMode)
 	if err != nil {
 		return nil, err
 	}

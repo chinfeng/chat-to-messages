@@ -388,3 +388,71 @@ func TestLoadEmptyTurnRetriesClamp(t *testing.T) {
 		t.Errorf("zero retries = %d", cfg.EmptyTurnMaxRetries)
 	}
 }
+
+func TestLoadReasoningReplayDefaults(t *testing.T) {
+	cfg := Load(nil)
+	if cfg.DefaultReasoningReplay != ReplayModeThinkTags {
+		t.Errorf("DefaultReasoningReplay = %q, want %q", cfg.DefaultReasoningReplay, ReplayModeThinkTags)
+	}
+	if len(cfg.ReasoningReplayRules) != 0 {
+		t.Errorf("ReasoningReplayRules = %v, want none", cfg.ReasoningReplayRules)
+	}
+}
+
+func TestLoadReasoningReplayGlobalMode(t *testing.T) {
+	cfg := Load([]string{"--reasoning-replay", "reasoning_content"})
+	if cfg.DefaultReasoningReplay != ReplayModeReasoningContent {
+		t.Errorf("DefaultReasoningReplay = %q, want %q", cfg.DefaultReasoningReplay, ReplayModeReasoningContent)
+	}
+	if len(cfg.ReasoningReplayRules) != 0 {
+		t.Errorf("ReasoningReplayRules = %v, want none", cfg.ReasoningReplayRules)
+	}
+}
+
+func TestLoadReasoningReplayRules(t *testing.T) {
+	cfg := Load([]string{
+		"--reasoning-replay", "moonshotai/kimi-k*=reasoning_content",
+		"--reasoning-replay", "deepseek*=disabled",
+		"--reasoning-replay", "disabled",
+	})
+	want := []ReasoningReplayRule{
+		{Pattern: "moonshotai/kimi-k*", Mode: ReplayModeReasoningContent},
+		{Pattern: "deepseek*", Mode: ReplayModeDisabled},
+	}
+	if !reflect.DeepEqual(cfg.ReasoningReplayRules, want) {
+		t.Errorf("ReasoningReplayRules = %#v, want %#v", cfg.ReasoningReplayRules, want)
+	}
+	if cfg.DefaultReasoningReplay != ReplayModeDisabled {
+		t.Errorf("DefaultReasoningReplay = %q, want %q", cfg.DefaultReasoningReplay, ReplayModeDisabled)
+	}
+}
+
+func TestLoadSkipsInvalidReasoningReplay(t *testing.T) {
+	cfg := Load([]string{
+		"--reasoning-replay", "bogus",
+		"--reasoning-replay", "kimi*=bogus",
+		"--reasoning-replay", "=reasoning_content",
+	})
+	if cfg.DefaultReasoningReplay != ReplayModeThinkTags {
+		t.Errorf("DefaultReasoningReplay = %q, want untouched %q", cfg.DefaultReasoningReplay, ReplayModeThinkTags)
+	}
+	if len(cfg.ReasoningReplayRules) != 0 {
+		t.Errorf("ReasoningReplayRules = %v, want none", cfg.ReasoningReplayRules)
+	}
+}
+
+func TestResolveReasoningReplay(t *testing.T) {
+	rules := []ReasoningReplayRule{
+		{Pattern: "moonshotai/kimi-k*", Mode: ReplayModeReasoningContent},
+		{Pattern: "*", Mode: ReplayModeDisabled},
+	}
+	if got := ResolveReasoningReplay("moonshotai/kimi-k3", rules, ReplayModeThinkTags); got != ReplayModeReasoningContent {
+		t.Errorf("kimi-k3 = %q, want %q", got, ReplayModeReasoningContent)
+	}
+	if got := ResolveReasoningReplay("glm-5", rules, ReplayModeThinkTags); got != ReplayModeDisabled {
+		t.Errorf("glm-5 = %q, want %q", got, ReplayModeDisabled)
+	}
+	if got := ResolveReasoningReplay("anything", nil, ReplayModeThinkTags); got != ReplayModeThinkTags {
+		t.Errorf("nil rules = %q, want fallback %q", got, ReplayModeThinkTags)
+	}
+}

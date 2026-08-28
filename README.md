@@ -139,6 +139,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--empty-turn-guard` | `true` | Retry the upstream request when a turn ends with reasoning but no visible text and no tool call (kimi-k3/GLM collapse guard) |
 | `--empty-turn-retries` | `2` | Max empty-turn retry attempts per request (0-5) |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
+| `--reasoning-replay` | `think_tags` | How assistant thinking blocks are replayed upstream: `think_tags`, `reasoning_content`, or `disabled`. Accepts a bare mode (global default) or `glob=mode` per-model rules (repeatable, first match wins); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
 | `--enable-web-search` | `false` | Enable proxy-side web search |
 | `--web-search-engine` | `brave` | Search engine type: `brave` (Brave Search API) or `searxng` (SearXNG) |
@@ -269,6 +270,28 @@ When a request arrives with `model: "claude-sonnet-4-20250514"`, the matching `c
 ```bash
 --upstream-extra-params '*={"$delete":["user","seed"],"$default":{"max_tokens":4096},"temperature":0.2}'
 ```
+
+### Reasoning Replay
+
+Controls how the proxy replays assistant thinking blocks back to the upstream model in follow-up requests. Upstream chat templates disagree on where thinking belongs in the conversation history, so the mode is configured per model:
+
+| Mode | Behavior | For |
+|------|----------|-----|
+| `think_tags` (default) | Thinking is embedded as literal `<think>...</think>` text in the assistant message content | GLM-family and most OpenAI-compatible upstreams |
+| `reasoning_content` | Thinking is sent as the OpenAI-style `reasoning_content` field on the assistant message | Kimi K3 (and K2-thinking) in thinking mode |
+| `disabled` | Thinking blocks are not replayed at all | Upstreams that reject or ignore reasoning history |
+
+`--reasoning-replay` accepts either a bare mode (sets the global default) or `glob=mode` (adds a per-model rule, first match wins):
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.example.com/v1 \
+  --upstream-api-key sk-xxx \
+  --reasoning-replay 'moonshotai/kimi-k*=reasoning_content' \
+  --reasoning-replay 'deepseek*=disabled'
+```
+
+**Why per model:** Kimi's API requires assistant tool-call messages to carry `reasoning_content` when thinking is enabled; replaying them without it renders out-of-distribution history and manifests as the model emitting its reasoning as text and ending the turn without any tool call. DeepSeek is the opposite — its API returns a 400 error when `reasoning_content` appears in input messages. GLM-family models are trained with `<think>` markup in context, so the default `think_tags` mode is already their native representation. Keep the default unless a model documents a different contract.
 
 ### Passthrough Mode
 

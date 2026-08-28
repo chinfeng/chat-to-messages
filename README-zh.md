@@ -139,6 +139,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--empty-turn-guard` | `true` | 空回合守卫：回合以推理结束但既无可见文本也无工具调用时，自动向上游发起有界重试（针对 kimi-k3/GLM 塌方模式） |
 | `--empty-turn-retries` | `2` | 每个请求允许的空回合重试次数上限（0-5） |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
+| `--reasoning-replay` | `think_tags` | 助手 thinking 块回放给上游的方式：`think_tags`、`reasoning_content` 或 `disabled`。接受裸模式（全局默认）或 `glob=mode` 按模型规则（可重复指定，首个匹配生效）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
 | `--enable-web-search` | `false` | 启用代理端 Web 搜索 |
 | `--web-search-engine` | `brave` | 搜索引擎类型：`brave`（Brave Search API）或 `searxng`（SearXNG） |
@@ -269,6 +270,28 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 ```bash
 --upstream-extra-params '*={"$delete":["user","seed"],"$default":{"max_tokens":4096},"temperature":0.2}'
 ```
+
+### 推理回放（按模型）
+
+控制代理在后续请求中如何把助手 thinking 块回放给上游模型。各家上游的 chat template 对"思考在历史中的位置"约定不一致，因此该模式按模型配置：
+
+| 模式 | 行为 | 适用 |
+|------|------|------|
+| `think_tags`（默认） | thinking 以字面 `<think>...</think>` 文本嵌入助手消息 content | GLM 系及多数 OpenAI 兼容上游 |
+| `reasoning_content` | thinking 以 OpenAI 风格的 `reasoning_content` 字段随助手消息发送 | Kimi K3（及 K2-thinking）thinking 模式 |
+| `disabled` | 完全不回放 thinking 块 | 拒绝或忽略推理历史的上游 |
+
+`--reasoning-replay` 接受裸模式（设置全局默认）或 `glob=mode`（添加按模型规则，首个匹配生效）：
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.example.com/v1 \
+  --upstream-api-key sk-xxx \
+  --reasoning-replay 'moonshotai/kimi-k*=reasoning_content' \
+  --reasoning-replay 'deepseek*=disabled'
+```
+
+**为什么按模型区分：** Kimi 官方要求 thinking 模式下 assistant 的 tool call 消息必须携带 `reasoning_content`；缺失该字段会让模型看到分布外的历史，表现为把推理当正文输出、宣布计划后直接结束回合而不发出任何工具调用。DeepSeek 恰好相反——输入 messages 中出现 `reasoning_content` 会直接返回 400 错误。GLM 系模型在训练中就使用上下文内的 `<think>` 标记，默认 `think_tags` 模式即其原生表达。除非模型文档另有约定，请保持默认值。
 
 ### 透传模式
 

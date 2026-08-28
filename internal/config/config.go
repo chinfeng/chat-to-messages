@@ -11,10 +11,31 @@ import (
 	"strings"
 )
 
+// Reasoning replay modes accepted by --reasoning-replay. String values mirror
+// convert.ReasoningReplayMode; duplicated here as plain strings so this
+// package stays dependency-free (proxy casts on use).
+const (
+	ReplayModeThinkTags        = "think_tags"
+	ReplayModeReasoningContent = "reasoning_content"
+	ReplayModeDisabled         = "disabled"
+)
+
+var reasoningReplayModes = map[string]bool{
+	ReplayModeThinkTags:        true,
+	ReplayModeReasoningContent: true,
+	ReplayModeDisabled:         true,
+}
+
 // ModelOverride maps a model glob pattern to extra upstream params.
 type ModelOverride struct {
 	Pattern string
 	Extra   map[string]any
+}
+
+// ReasoningReplayRule maps a model glob pattern to a reasoning replay mode.
+type ReasoningReplayRule struct {
+	Pattern string
+	Mode    string
 }
 
 // ServerToolConfig holds the server-side tool (web_search / web_fetch) settings.
@@ -39,6 +60,12 @@ type Config struct {
 	DumpDir         string
 	ModelOverrides  []ModelOverride
 	ServerTools     ServerToolConfig
+
+	// DefaultReasoningReplay is the replay mode used when no
+	// ReasoningReplayRules entry matches the request model.
+	DefaultReasoningReplay string
+	// ReasoningReplayRules are per-model replay overrides (first match wins).
+	ReasoningReplayRules []ReasoningReplayRule
 
 	// SanitizeClientMetaTurns normalizes Claude Code's synthetic user meta
 	// turns ("[Your previous response had no visible output...]", "(no
@@ -159,6 +186,35 @@ func Load(args []string) *Config {
 		modelOverrides = append(modelOverrides, ModelOverride{Pattern: pattern, Extra: obj})
 	}
 
+	// --reasoning-replay: a bare mode sets the global default; glob=mode adds
+	// a per-model rule (first matching rule wins over the default).
+	defaultReplay := ReplayModeThinkTags
+	var replayRules []ReasoningReplayRule
+	for _, raw := range getMultiArg("reasoning-replay") {
+		if eqIdx := strings.Index(raw, "="); eqIdx != -1 {
+			pattern := strings.TrimSpace(raw[:eqIdx])
+			mode := strings.TrimSpace(raw[eqIdx+1:])
+			if pattern == "" {
+				warn("Skipping --reasoning-replay with empty pattern: %s", raw)
+				continue
+			}
+			if !reasoningReplayModes[mode] {
+				warn("Skipping --reasoning-replay with unknown mode for pattern %q: %s (want %s | %s | %s)",
+					pattern, mode, ReplayModeThinkTags, ReplayModeReasoningContent, ReplayModeDisabled)
+				continue
+			}
+			replayRules = append(replayRules, ReasoningReplayRule{Pattern: pattern, Mode: mode})
+			continue
+		}
+		mode := strings.TrimSpace(raw)
+		if !reasoningReplayModes[mode] {
+			warn("Skipping --reasoning-replay with unknown mode: %s (want %s | %s | %s)",
+				mode, ReplayModeThinkTags, ReplayModeReasoningContent, ReplayModeDisabled)
+			continue
+		}
+		defaultReplay = mode
+	}
+
 	serverTools := ServerToolConfig{
 		WebSearch:                getBool("enable-web-search", false),
 		WebFetch:                 getBool("enable-web-fetch", false),
@@ -196,6 +252,8 @@ func Load(args []string) *Config {
 		DumpDir:                 getArg("dump", ""),
 		ModelOverrides:          modelOverrides,
 		ServerTools:             serverTools,
+		DefaultReasoningReplay:  defaultReplay,
+		ReasoningReplayRules:    replayRules,
 		SanitizeClientMetaTurns: getBool("sanitize-client-meta-turns", true),
 		EmptyTurnGuard:          getBool("empty-turn-guard", true),
 		EmptyTurnMaxRetries:     emptyTurnRetries,
@@ -226,4 +284,15 @@ func ResolveModelExtra(model string, overrides []ModelOverride) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+// ResolveReasoningReplay returns the reasoning replay mode for model: the mode
+// of the first matching rule, else fallback.
+func ResolveReasoningReplay(model string, rules []ReasoningReplayRule, fallback string) string {
+	for _, rule := range rules {
+		if GlobMatch(rule.Pattern, model) {
+			return rule.Mode
+		}
+	}
+	return fallback
 }
