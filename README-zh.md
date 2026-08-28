@@ -280,7 +280,7 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 
 ### 请求转储
 
-启用 `--dump <dir>` 后，每个下游请求都会被记录。会话先写入 `<dir>/in-progress/<id>/`（`<id>` 为 UUID），结束时按**根因**重命名到分类桶：
+启用 `--dump <dir>` 后，每个下游请求都会被记录。会话先写入 `<dir>/in-progress/<id>/`（`<id>` 为时间序 UUID v7），结束时按**根因**重命名到分类桶：
 
 | 桶 | 含义 |
 |----|------|
@@ -289,7 +289,7 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 | `upstream-aborted` | 上游连接中断 / 未正常 finish 即中止 |
 | `failed` | 上游超时、上游错误状态或空响应、未知终止 |
 
-最终目录名为 `<id>__START_<开始时间>__END_<结束时间>`。由于 `<id>` 是 UUID，目录名本身不保证时间顺序，但可按目录名中的 `__START_` 时间戳恢复各桶内的时序。客户端主动断开优先于一切；其次以上游自身的终止记录为准；最后才是下游侧记录的结果。
+最终目录名为 `<id>__START_<开始时间>__END_<结束时间>`。`<id>` 为 UUID v7，其前 48 位编码了请求发起的 Unix 毫秒时间戳，因此按目录名字典序排序即可得到各桶内的请求时序（`__START_`/`__END_` 后缀仅便于人眼阅读）。客户端主动断开优先于一切；其次以上游自身的终止记录为准；最后才是下游侧记录的结果。
 
 每个会话包含 `downstream-request.log`、`downstream-response.log`、`upstream-request.log` 和 `upstream-response.log` — 流式响应体即为完整 SSE 事件流。若调用了代理端 server tools（web_search / web_fetch / agentic loop），还会额外写入按调用逐条记录的 `server-tools.log`。
 
@@ -305,9 +305,9 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 ```
 /var/log/chat-to-messages/
 ├── in-progress/
-│   └── 3f1a2b4c-8d9e-4f5a-b6c7-8d9e0f1a2b3c/
+│   └── 3f1a2b4c-8d9e-7f5a-b6c7-8d9e0f1a2b3c/
 ├── completed/
-│   └── 3f1a2b4c-8d9e-4f5a-b6c7-8d9e0f1a2b3c__START_2026-05-20T08-30-00-000Z__END_2026-05-20T08-30-05-123Z/
+│   └── 3f1a2b4c-8d9e-7f5a-b6c7-8d9e0f1a2b3c__START_2026-05-20T08-30-00-000Z__END_2026-05-20T08-30-05-123Z/
 │       ├── downstream-request.log
 │       ├── downstream-response.log
 │       ├── upstream-request.log

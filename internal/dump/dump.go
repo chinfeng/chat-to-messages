@@ -77,9 +77,10 @@ type Session struct {
 }
 
 // NewSession creates a dump session. A session writes to
-// <dir>/in-progress/<id>/, where id is a crypto/rand UUID v4-shaped string
-// (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx, matching TS randomUUIDv7's shape).
-// dir == "" returns a no-op session whose methods do nothing.
+// <dir>/in-progress/<id>/, where id is a time-ordered UUID v7
+// (xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx). Sorting directory names therefore
+// orders sessions by request start time. dir == "" returns a no-op session
+// whose methods do nothing.
 func NewSession(dir string) *Session {
 	if dir == "" {
 		return &Session{noop: true}
@@ -358,15 +359,23 @@ func formatServerToolEntry(e ServerToolLogEntry) string {
 	return out
 }
 
-// newID returns a crypto/rand UUID v4-shaped id
-// (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx). rand.Read failure panics, mirroring
-// TS randomUUIDv7 throwing on entropy failure.
+// newID returns a time-ordered UUID v7 id (RFC 9562, method 1). The leading
+// 48 bits are the Unix timestamp in milliseconds, so ids sort
+// lexicographically into request-start order. rand.Read failure panics,
+// mirroring TS randomUUIDv7 throwing on entropy failure.
 func newID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		panic("dump: crypto/rand unavailable: " + err.Error())
 	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	ts := uint64(time.Now().UnixMilli())
+	b[0] = byte(ts >> 40)
+	b[1] = byte(ts >> 32)
+	b[2] = byte(ts >> 24)
+	b[3] = byte(ts >> 16)
+	b[4] = byte(ts >> 8)
+	b[5] = byte(ts)
+	b[6] = (b[6] & 0x0f) | 0x70 // version 7
 	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

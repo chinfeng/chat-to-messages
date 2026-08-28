@@ -3,9 +3,42 @@ package dump
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestNewIDIsTimeOrderedUUIDv7(t *testing.T) {
+	before := time.Now().UnixMilli()
+	a := newID()
+	b := newID()
+	after := time.Now().UnixMilli()
+
+	for _, id := range []string{a, b} {
+		if id[14] != '7' {
+			t.Errorf("id %q: version nibble %q, want '7' (UUID v7)", id, id[14:18])
+		}
+		if c := id[19]; c != '8' && c != '9' && c != 'a' && c != 'b' {
+			t.Errorf("id %q: variant nibble %q, want 8/9/a/b", id, c)
+		}
+	}
+	// 前 48 位为毫秒时间戳，占前 12 个十六进制字符（第 8 位后跟连字符）。
+	ts := func(id string) int64 {
+		v, err := strconv.ParseInt(strings.ReplaceAll(id[:13], "-", ""), 16, 64)
+		if err != nil {
+			t.Fatalf("parse %q: %v", id[:13], err)
+		}
+		return v
+	}
+	ta, tb := ts(a), ts(b)
+	if ta < before || ta > after || tb < before || tb > after {
+		t.Errorf("timestamp out of range: before=%d a=%d b=%d after=%d", before, ta, tb, after)
+	}
+	if ta > tb {
+		t.Errorf("ids not time-ordered: a=%d b=%d", ta, tb)
+	}
+}
 
 func TestNoopSessionWhenDirEmpty(t *testing.T) {
 	s := NewSession("")
