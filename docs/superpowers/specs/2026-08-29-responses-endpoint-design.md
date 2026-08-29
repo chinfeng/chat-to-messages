@@ -75,3 +75,17 @@ usage 映射：`input_tokens←prompt_tokens`,`output_tokens←completion_tokens
 
 hosted tools 执行、background、本地截断、检索端点（GET/DELETE/list)、empty-turn guard 接入 responses 路径、server-tool agentic loop 接入
 
+
+## WebSocket 传输（2026-08-29 追加实现）
+
+对照 OpenAI websocket mode（协议事实取自 codex-rs `codex-api/src/endpoint/responses_websocket.rs` 客户端与 pipecat 实现）：
+
+- 握手：`GET /v1/responses` + RFC 6455 upgrade(`internal/ws`,stdlib 手写；不协商 permessage-deflate 与子协议——按 RFC 省略即拒绝，客户端自动回退）
+- 客户端帧（text,JSON):`{type:"response.create", …正常 Responses 请求体…}`、`{type:"response.cancel","response_id":…}`；未知 type / 坏 JSON / 二进制帧 → error frame
+- 服务端帧（text)：与 SSE `data:` 载荷完全一致的 Responses 事件 JSON，一事件一帧；请求级错误发 `{"type":"error","status":N,"error":{"type","code"?,"param"?,"message"}}`
+- 特殊 code:`previous_response_not_found`(404,codex 收到后重发全量上下文）、`response_in_progress`(400；一条连接同时只允许一个 response,OpenAI 同款约束）
+- `generate:false`(codex warmup)：不调上游，直接 completed 空响应，但照常写 chain——省一次作废的生成
+- store 语义差异：WS 忽略 `store:false`（对齐 OpenAI 的连接级缓存语义；codex 恒发 store:false，若遵守则每轮重发全量）
+- `response.cancel`：协同取消（ctx 取消上游读，translator Finish 照常收尾发终态事件）;codex 从不发 cancel（直接断连）
+- dump：每个 response.create 一个 session
+- 不做：OpenAI 60 分钟连接上限(`websocket_connection_limit_reached`)、realtime 音频

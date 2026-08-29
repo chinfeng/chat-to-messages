@@ -28,6 +28,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
 	"github.com/chinfeng/chat-to-messages/internal/sse"
 	"github.com/chinfeng/chat-to-messages/internal/stream"
+	"github.com/chinfeng/chat-to-messages/internal/ws"
 )
 
 // upstreamSSEHeaders mirrors ANTHROPIC_SSE_RESPONSE_HEADERS in the TS
@@ -163,6 +164,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, r
 		handleMessages(w, r, cfg)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
 		handleResponses(w, r, cfg, responsesStore)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/responses":
+		// OpenAI websocket mode: same dialect, upgrade instead of POST.
+		if ws.IsUpgrade(r) {
+			handleResponsesWS(w, r, cfg, responsesStore)
+		} else {
+			writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error", "GET /v1/responses requires a websocket upgrade (use POST for SSE)."))
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		forwardPassthrough(w, r, cfg, "/chat/completions")
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
