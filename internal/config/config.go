@@ -84,6 +84,11 @@ type Config struct {
 	// EmptyTurnMaxRetries bounds EmptyTurnGuard re-requests per downstream
 	// request (clamped to 0-5).
 	EmptyTurnMaxRetries int
+
+	// ResponsesStoreTTLMinutes is the sliding TTL of the /v1/responses proxy
+	// store (previous_response_id chains), in minutes; 0 disables the store
+	// (any previous_response_id then 404s).
+	ResponsesStoreTTLMinutes int
 }
 
 // warn mirrors console.warn (stderr, no timestamp).
@@ -244,19 +249,20 @@ func Load(args []string) *Config {
 	}
 
 	return &Config{
-		UpstreamBaseURL:         getArg("upstream-base-url", "https://api.openai.com/v1"),
-		UpstreamAPIKey:          getArg("upstream-api-key", ""),
-		AuthToken:               getArg("auth-token", ""),
-		Port:                    port,
-		EnableThinking:          getBool("enable-thinking", true),
-		DumpDir:                 getArg("dump", ""),
-		ModelOverrides:          modelOverrides,
-		ServerTools:             serverTools,
-		DefaultReasoningReplay:  defaultReplay,
-		ReasoningReplayRules:    replayRules,
-		SanitizeClientMetaTurns: getBool("sanitize-client-meta-turns", true),
-		EmptyTurnGuard:          getBool("empty-turn-guard", true),
-		EmptyTurnMaxRetries:     emptyTurnRetries,
+		UpstreamBaseURL:          getArg("upstream-base-url", "https://api.openai.com/v1"),
+		UpstreamAPIKey:           getArg("upstream-api-key", ""),
+		AuthToken:                getArg("auth-token", ""),
+		Port:                     port,
+		EnableThinking:           getBool("enable-thinking", true),
+		DumpDir:                  getArg("dump", ""),
+		ModelOverrides:           modelOverrides,
+		ServerTools:              serverTools,
+		DefaultReasoningReplay:   defaultReplay,
+		ReasoningReplayRules:     replayRules,
+		SanitizeClientMetaTurns:  getBool("sanitize-client-meta-turns", true),
+		EmptyTurnGuard:           getBool("empty-turn-guard", true),
+		EmptyTurnMaxRetries:      emptyTurnRetries,
+		ResponsesStoreTTLMinutes: parseInt(getArg("responses-store-ttl-minutes", "1440")),
 	}
 }
 

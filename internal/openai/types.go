@@ -48,16 +48,21 @@ type ToolCallFunction struct {
 }
 
 type Usage struct {
-	PromptTokens             int64                `json:"prompt_tokens,omitempty"`
-	CompletionTokens         int64                `json:"completion_tokens,omitempty"`
-	CacheReadInputTokens     *int64               `json:"cache_read_input_tokens,omitempty"`
-	CacheCreationInputTokens *int64               `json:"cache_creation_input_tokens,omitempty"`
-	PromptTokensDetails      *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	PromptTokens             int64                  `json:"prompt_tokens,omitempty"`
+	CompletionTokens         int64                  `json:"completion_tokens,omitempty"`
+	CacheReadInputTokens     *int64                 `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens *int64                 `json:"cache_creation_input_tokens,omitempty"`
+	PromptTokensDetails      *PromptTokensDetails   `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails  *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 type PromptTokensDetails struct {
 	CachedTokens     *int64 `json:"cached_tokens,omitempty"`
 	CacheWriteTokens *int64 `json:"cache_write_tokens,omitempty"`
+}
+
+type CompletionTokensDetails struct {
+	ReasoningTokens *int64 `json:"reasoning_tokens,omitempty"`
 }
 
 type Error struct {

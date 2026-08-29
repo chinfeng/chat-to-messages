@@ -24,6 +24,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/convert"
 	"github.com/chinfeng/chat-to-messages/internal/dump"
 	"github.com/chinfeng/chat-to-messages/internal/openai"
+	"github.com/chinfeng/chat-to-messages/internal/responses"
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
 	"github.com/chinfeng/chat-to-messages/internal/sse"
 	"github.com/chinfeng/chat-to-messages/internal/stream"
@@ -135,8 +136,11 @@ func headerMap(h http.Header) map[string]string {
 }
 
 // NewHandler returns the HTTP handler for the proxy: CORS preflight handling
-// first (matching Bun.serve in index.ts), then routing.
+// first (matching Bun.serve in index.ts), then routing. The /v1/responses
+// request store (previous_response_id chains) is per-server state created
+// here.
 func NewHandler(cfg *config.Config) http.Handler {
+	responsesStore := responses.NewStore(time.Duration(cfg.ResponsesStoreTTLMinutes) * time.Minute)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -146,17 +150,19 @@ func NewHandler(cfg *config.Config) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		handleRequest(w, r, cfg)
+		handleRequest(w, r, cfg, responsesStore)
 	})
 }
 
 // handleRequest routes a request (port of routeRequest() in routes.ts).
-func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, responsesStore *responses.Store) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
 		handleMessages(w, r, cfg)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+		handleResponses(w, r, cfg, responsesStore)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		forwardPassthrough(w, r, cfg, "/chat/completions")
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":

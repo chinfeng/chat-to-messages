@@ -32,6 +32,7 @@ func main() {
 	fmt.Printf("  Passthrough mode: %v\n", passthrough)
 	fmt.Printf("  Thinking: %v\n", cfg.EnableThinking)
 	fmt.Printf("  OpenAI passthrough: /v1/chat/completions, /v1/models\n")
+	fmt.Printf("  OpenAI responses: /v1/responses (SSE, store TTL %d min)\n", cfg.ResponsesStoreTTLMinutes)
 	fmt.Printf("  Dump: %s\n", orDisabled(cfg.DumpDir))
 	if len(cfg.ModelOverrides) > 0 {
 		fmt.Printf("  Model overrides:\n")
