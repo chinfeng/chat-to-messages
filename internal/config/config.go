@@ -89,6 +89,13 @@ type Config struct {
 	// store (previous_response_id chains), in minutes; 0 disables the store
 	// (any previous_response_id then 404s).
 	ResponsesStoreTTLMinutes int
+
+	// MaxUpstreamImages caps the number of images sent to the upstream per
+	// request: older images (earliest first, document order) are replaced
+	// with text placeholders before conversion. The z-ai channel
+	// deterministically fails requests carrying >= 8 images (dumped
+	// 2026-09-12); default 7, 0 disables eviction.
+	MaxUpstreamImages int
 }
 
 // warn mirrors console.warn (stderr, no timestamp).
@@ -248,6 +255,13 @@ func Load(args []string) *Config {
 		emptyTurnRetries = 2
 	}
 
+	// Upstream image cap: negative is a typo — fall back to the default 7.
+	maxUpstreamImages := parseInt(getArg("max-upstream-images", "7"))
+	if maxUpstreamImages < 0 {
+		warn("Invalid --max-upstream-images %d (must be >= 0); using 7", maxUpstreamImages)
+		maxUpstreamImages = 7
+	}
+
 	return &Config{
 		UpstreamBaseURL:          getArg("upstream-base-url", "https://api.openai.com/v1"),
 		UpstreamAPIKey:           getArg("upstream-api-key", ""),
@@ -263,6 +277,7 @@ func Load(args []string) *Config {
 		EmptyTurnGuard:           getBool("empty-turn-guard", true),
 		EmptyTurnMaxRetries:      emptyTurnRetries,
 		ResponsesStoreTTLMinutes: parseInt(getArg("responses-store-ttl-minutes", "1440")),
+		MaxUpstreamImages:        maxUpstreamImages,
 	}
 }
 

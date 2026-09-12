@@ -471,6 +471,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
+	// Evict old images to text placeholders before conversion — the upstream
+	// channel deterministically fails requests carrying too many images
+	// (z-ai: >= 8); the most recent MaxUpstreamImages survive.
+	convert.EvictOldImages(req.Messages, cfg.MaxUpstreamImages)
+
 	requestData := &convert.RequestData{
 		Model:         req.Model,
 		Messages:      req.Messages,

@@ -138,6 +138,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--sanitize-client-meta-turns` | `true` | 将 Claude Code 注入的合成用户轮（`[Your previous response had no visible output...]`、`(no content)`、中断标记）规约为中性续作指令后再重放给上游模型 |
 | `--empty-turn-guard` | `true` | 空回合守卫：回合以推理结束但既无可见文本也无工具调用时，自动向上游发起有界重试（针对 kimi-k3/GLM 塌方模式） |
 | `--empty-turn-retries` | `2` | 每个请求允许的空回合重试次数上限（0-5） |
+| `--max-upstream-images` | `7` | 每个请求发送到上游的图片数量上限；超出的较早图片（从最早开始）替换为文本占位符（z-ai 渠道 ≥8 张必挂）。`0` 禁用裁剪 |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--reasoning-replay` | `think_tags` | 助手 thinking 块回放给上游的方式：`think_tags`、`reasoning_content` 或 `disabled`。接受裸模式（全局默认）或 `glob=mode` 按模型规则（可重复指定，首个匹配生效）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
