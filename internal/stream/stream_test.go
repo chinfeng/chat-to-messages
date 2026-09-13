@@ -463,6 +463,80 @@ func TestStreamConnectionClosedMidStream(t *testing.T) {
 	}
 }
 
+func TestStreamMidStreamRetryContinues(t *testing.T) {
+	// Upstream dies mid-stream after emitting thinking + buffering text; the
+	// retry hook supplies a fresh sequence that completes cleanly. The
+	// continuation re-streams into the SAME message: the aborted thinking
+	// block is closed (signature), the never-emitted buffered text is DROPPED
+	// (anti-pollution), and finalize runs normally.
+	first := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ReasoningContent: strPtr("partial thought")}}}},
+		// Buffered by the heuristic tool parser, never emitted downstream.
+		{Choices: []openai.Choice{{Delta: &openai.Delta{Content: strPtr("half-finished prelude")}}}},
+		{Err: errors.New("connection reset by peer")},
+	}
+	second := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ReasoningContent: strPtr("retry thinking")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{Content: strPtr("the plan")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{}, FinishReason: strPtr("stop")}}},
+		{Done: true},
+	}
+	attempts := 0
+	st := NewStreamer(context.Background(), seqFromSlice(first), req(t, "m1"), 10, true, nil,
+		&Options{MidStreamRetry: func(attempt int, err error) iter.Seq[openai.Chunk] {
+			attempts++
+			if attempt != attempts {
+				t.Errorf("attempt = %d, want %d", attempt, attempts)
+			}
+			return seqFromSlice(second)
+		}})
+	ev, err := collect(t, st)
+	if err != nil {
+		t.Fatalf("retry must complete cleanly: %v", err)
+	}
+	joined := strings.Join(ev, "\n")
+	if !strings.Contains(joined, "message_delta") || !strings.Contains(joined, "message_stop") {
+		t.Errorf("finalize must run after successful retry: %s", joined)
+	}
+	if strings.Contains(joined, "half-finished prelude") {
+		t.Errorf("buffered text must be dropped, not flushed: %s", joined)
+	}
+	if !strings.Contains(joined, "retry thinking") || !strings.Contains(joined, "the plan") {
+		t.Errorf("retry content missing: %s", joined)
+	}
+	if got := strings.Count(joined, `"content_block":{"type":"thinking"`); got != 2 {
+		t.Errorf("thinking blocks = %d, want 2 (aborted closed + retry fresh)", got)
+	}
+	if attempts != 1 {
+		t.Errorf("hook called %d times, want 1", attempts)
+	}
+}
+
+func TestStreamMidStreamNoRetryWithToolBlock(t *testing.T) {
+	// A partial tool_use block was already emitted; retrying would leave a
+	// corrupt tool block downstream — the guard must not retry.
+	chunks := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ToolCalls: []openai.ToolCallDelta{{
+			Index: 0, ID: strPtr("tc1"),
+			Function: openai.ToolCallFunction{Name: strPtr("read_file"), Arguments: strPtr("{\"path\"")},
+		}}}}}},
+		{Err: errors.New("connection reset by peer")},
+	}
+	called := false
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil,
+		&Options{MidStreamRetry: func(attempt int, err error) iter.Seq[openai.Chunk] {
+			called = true
+			return nil
+		}})
+	_, err := collect(t, st)
+	if err == nil {
+		t.Fatal("expected UpstreamAbortedError")
+	}
+	if called {
+		t.Error("hook must not fire when a tool block is in flight")
+	}
+}
+
 func TestStreamDoneWithoutFinishReason(t *testing.T) {
 	body := "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n" +
 		"data: [DONE]\n\n" // 无 finish_reason 但 [DONE]

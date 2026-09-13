@@ -85,6 +85,15 @@ type Config struct {
 	// request (clamped to 0-5).
 	EmptyTurnMaxRetries int
 
+	// MidStreamStallTimeout closes the upstream connection when no bytes
+	// arrive for this many seconds, then retries the request once into the
+	// same downstream SSE message (bounded, tool-call-free continuations
+	// only). The newapi/GLM relay stalls ~135s and then kills the connection
+	// on long plan generations (dumped 2026-09-13); the watchdog cuts the
+	// wait and the retry salvages the turn. 0 disables the watchdog and the
+	// mid-stream retry entirely.
+	MidStreamStallTimeout int
+
 	// ResponsesStoreTTLMinutes is the sliding TTL of the /v1/responses proxy
 	// store (previous_response_id chains), in minutes; 0 disables the store
 	// (any previous_response_id then 404s).
@@ -262,6 +271,13 @@ func Load(args []string) *Config {
 		maxUpstreamImages = 7
 	}
 
+	// Mid-stream stall window: negative is a typo — fall back to the default.
+	midStreamStall := parseInt(getArg("mid-stream-stall-timeout", "60"))
+	if midStreamStall < 0 {
+		warn("Invalid --mid-stream-stall-timeout %d (must be >= 0); using 60", midStreamStall)
+		midStreamStall = 60
+	}
+
 	return &Config{
 		UpstreamBaseURL:          getArg("upstream-base-url", "https://api.openai.com/v1"),
 		UpstreamAPIKey:           getArg("upstream-api-key", ""),
@@ -276,6 +292,7 @@ func Load(args []string) *Config {
 		SanitizeClientMetaTurns:  getBool("sanitize-client-meta-turns", true),
 		EmptyTurnGuard:           getBool("empty-turn-guard", true),
 		EmptyTurnMaxRetries:      emptyTurnRetries,
+		MidStreamStallTimeout:    midStreamStall,
 		ResponsesStoreTTLMinutes: parseInt(getArg("responses-store-ttl-minutes", "1440")),
 		MaxUpstreamImages:        maxUpstreamImages,
 	}

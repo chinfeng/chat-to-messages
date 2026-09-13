@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
@@ -72,6 +73,20 @@ type Options struct {
 	// collapse where the model states its intent inside <think> and then
 	// abandons the turn with no tool call (dumped 2026-08-27).
 	InvisibleTurnRetry func(attempt int, info InvisibleTurnInfo) iter.Seq[openai.Chunk]
+	// MidStreamRetry, when non-nil, arms the mid-stream abort guard: when the
+	// upstream CONNECTION dies mid-stream (UpstreamAbortedError — a read
+	// error/reset or a clean EOF without finish_reason) and no tool block was
+	// started (a partial tool_use block cannot be closed into valid JSON),
+	// the hook is invoked and the returned chunk sequence continues the SAME
+	// downstream message: open blocks are closed (thinking keeps its
+	// signature) and buffered-but-unemitted parser content is DROPPED, never
+	// flushed — it never reached the client, so the half-finished prelude
+	// stays out of the transcript. Returning a nil sequence disables further
+	// retries. Retry failures are swallowed — the baseline abort path still
+	// produces the protocol-valid error event. GO-ONLY EXTENSION: the TS
+	// reference streams one response verbatim; this guards the newapi/GLM
+	// relay killing long plan generations mid-stream (dumped 2026-09-13).
+	MidStreamRetry func(attempt int, err error) iter.Seq[openai.Chunk]
 }
 
 // InvisibleTurnInfo snapshots an abandoned invisible turn for the
@@ -215,11 +230,57 @@ func (s *Streamer) run(yield func(string) bool) {
 	if stop {
 		return
 	}
+	loopErr = s.midStreamAbortGuard(emit, &stop, loopErr)
+	if stop {
+		return
+	}
 	if loopErr != nil {
 		s.handleError(emit, loopErr)
 		return
 	}
 	s.finalize(emit, &stop)
+}
+
+// midStreamAbortGuard mirrors emptyTurnGuard: bounded upstream retries when
+// the upstream connection died mid-stream. Continuation attempts stream fresh
+// blocks into the SAME downstream message (builder indices continue); parser
+// buffers hold content that never reached the client and are dropped, not
+// flushed. Aborts with a tool block in flight are not retried (partial
+// tool_use cannot be closed safely) — they fall through to the error path.
+func (s *Streamer) midStreamAbortGuard(emit func(string), stop *bool, loopErr error) error {
+	for attempt := 1; ; attempt++ {
+		var abortErr *UpstreamAbortedError
+		if !errors.As(loopErr, &abortErr) {
+			return loopErr
+		}
+		if stop != nil && *stop {
+			return loopErr
+		}
+		if s.builder.HasEmittedToolBlock() {
+			return loopErr
+		}
+		if s.opts == nil || s.opts.MidStreamRetry == nil {
+			return loopErr
+		}
+		seq := s.opts.MidStreamRetry(attempt, loopErr)
+		if seq == nil {
+			return loopErr
+		}
+		// Close open blocks (with thinking signature) so the continuation
+		// opens fresh blocks instead of appending into the aborted one, and
+		// reset the parsers: their internal buffers hold content from the
+		// doomed attempt that must stay dropped (re-creating is safe —
+		// anything the parsers would still emit was never emitted downstream,
+		// and a fully detected tool call would have set HasEmittedToolBlock
+		// above, disabling the retry).
+		for _, ev := range s.builder.CloseContentBlocks() {
+			emit(ev)
+		}
+		s.thinkParser = parsers.NewThinkTagParser()
+		s.heuristicParser = parsers.NewHeuristicToolParser()
+		s.chunks = seq
+		loopErr = s.iterate(emit, stop)
+	}
 }
 
 // processChunk handles one upstream chunk. done reports a [DONE] sentinel

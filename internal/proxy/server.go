@@ -405,6 +405,113 @@ func emptyTurnRetryHook(ctx context.Context, cfg *config.Config, session *dump.S
 	}
 }
 
+// stallWatchdogReader closes the body when no bytes arrive within the window,
+// breaking the blocked Read so the stream aborts and the mid-stream retry
+// guard takes over. The watchdog halts itself when the body ends (EOF or any
+// read error — including the error its own Close induced), so every exit path
+// (clean end, abort, early abandon) stops it; closing an http response body
+// twice is a no-op, so it may race the route's deferred Close.
+type stallWatchdogReader struct {
+	r      io.Reader
+	body   io.Closer
+	window time.Duration
+	last   atomic.Int64 // unix nano of the last received byte
+	stop   chan struct{}
+	halted sync.Once
+}
+
+func newStallWatchdog(r io.Reader, body io.Closer, window time.Duration) io.Reader {
+	if window <= 0 {
+		return r
+	}
+	w := &stallWatchdogReader{r: r, body: body, window: window, stop: make(chan struct{})}
+	w.last.Store(time.Now().UnixNano())
+	go w.watch()
+	return w
+}
+
+func (w *stallWatchdogReader) Read(p []byte) (int, error) {
+	n, err := w.r.Read(p)
+	if n > 0 {
+		w.last.Store(time.Now().UnixNano())
+	}
+	if err != nil {
+		w.halted.Do(func() { close(w.stop) })
+	}
+	return n, err
+}
+
+func (w *stallWatchdogReader) watch() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if time.Since(time.Unix(0, w.last.Load())) > w.window {
+				_ = w.body.Close() // break the blocked Read
+				return
+			}
+		case <-w.stop:
+			return
+		}
+	}
+}
+
+// midStreamRetryHook mirrors emptyTurnRetryHook: bounded re-requests of the
+// SAME conversation when the upstream connection dies mid-stream (the
+// newapi/GLM relay stalls ~135s and kills long plan generations, dumped
+// 2026-09-13). The continuation re-streams into the same downstream message;
+// the stream layer drops buffered parser content that never reached the
+// client. Budget is fixed at 2 (a wedged upstream burns tokens either way);
+// cfg.MidStreamStallTimeout <= 0 disables the hook entirely.
+func midStreamRetryHook(ctx context.Context, cfg *config.Config, session *dump.Session, requestData *convert.RequestData, apiKey string) func(int, error) iter.Seq[openai.Chunk] {
+	window := time.Duration(cfg.MidStreamStallTimeout) * time.Second
+	return func(attempt int, err error) iter.Seq[openai.Chunk] {
+		if window <= 0 || attempt > 2 {
+			return nil
+		}
+		fmt.Fprintln(os.Stderr, "chat-to-messages: mid-stream abort, retrying upstream (attempt", attempt, "):", err)
+		attemptNo := attempt + 1 // dump numbering: primary request = attempt 1
+
+		url, wire, pretty, err := buildUpstreamRequest(cfg, requestData, apiKey)
+		if err != nil {
+			return nil
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
+		if err != nil {
+			return nil
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		session.WriteUpstreamAttemptRequest(attemptNo, headerMap(httpReq.Header), time.Now().UTC().Format(time.RFC3339), string(pretty))
+
+		res, err := (&http.Client{}).Do(httpReq)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "chat-to-messages: mid-stream retry connect failed:", err)
+			return nil
+		}
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+			res.Body.Close()
+			session.WriteUpstreamAttemptResponse(attemptNo, headerMap(res.Header), res.StatusCode, string(body))
+			fmt.Fprintln(os.Stderr, "chat-to-messages: mid-stream retry got status", res.StatusCode)
+			return nil
+		}
+
+		var raw strings.Builder
+		seq := openai.IterSSEChunks(ctx, newStallWatchdog(res.Body, res.Body, window), &raw)
+		return func(yield func(openai.Chunk) bool) {
+			defer res.Body.Close()
+			for chunk := range seq {
+				if !yield(chunk) {
+					return
+				}
+			}
+			session.WriteUpstreamAttemptResponse(attemptNo, headerMap(res.Header), res.StatusCode, raw.String())
+		}
+	}
+}
+
 // handleMessages handles POST /v1/messages (port of handleMessages() in
 // routes.ts): auth, body validation, upstream request, and the SSE pump.
 func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
@@ -555,7 +662,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 	}
 
 	var rawUpstream strings.Builder
-	chunks := openai.IterSSEChunks(r.Context(), upstreamRes.Body, &rawUpstream)
+	upstreamBody := newStallWatchdog(upstreamRes.Body, upstreamRes.Body, time.Duration(cfg.MidStreamStallTimeout)*time.Second)
+	chunks := openai.IterSSEChunks(r.Context(), upstreamBody, &rawUpstream)
 	var downstreamAborted atomic.Bool
 	var downstreamChunks []string
 
@@ -563,6 +671,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		&stream.Options{
 			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
 			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
+			MidStreamRetry:      midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey),
 		})
 
 	// terminationReason is written by the pump goroutine (stream error
