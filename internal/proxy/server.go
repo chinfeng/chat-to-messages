@@ -648,7 +648,30 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
-	// --- Success: stream the upstream SSE to the downstream client ---
+	// --- Success: translate the upstream stream for the downstream client ---
+	var rawUpstream strings.Builder
+	upstreamBody := newStallWatchdog(upstreamRes.Body, upstreamRes.Body, time.Duration(cfg.MidStreamStallTimeout)*time.Second)
+	chunks := openai.IterSSEChunks(r.Context(), upstreamBody, &rawUpstream)
+	var downstreamAborted atomic.Bool
+
+	streamer := stream.NewStreamer(r.Context(), chunks, requestData, inputTokens, cfg.EnableThinking, session,
+		&stream.Options{
+			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
+			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
+			MidStreamRetry:      midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey),
+		})
+
+	// Non-streaming client (stream omitted or false — the Anthropic default):
+	// aggregate into ONE Message JSON. Claude Code's model-validation probe and
+	// side queries call create() non-streaming and read message.usage
+	// directly; answering SSE here crashed them with "Unable to validate
+	// model: undefined is not an object (evaluating 'xt.usage.input_tokens')"
+	// (dumped 2026-09-15).
+	if req.Stream == nil || !*req.Stream {
+		writeNonStreamMessages(w, r, session, requestStart, ttfb, upstreamHeaders, upstreamStatus, streamer, &rawUpstream)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	for k, v := range upstreamSSEHeaders {
 		w.Header().Set(k, v)
@@ -661,18 +684,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
-	var rawUpstream strings.Builder
-	upstreamBody := newStallWatchdog(upstreamRes.Body, upstreamRes.Body, time.Duration(cfg.MidStreamStallTimeout)*time.Second)
-	chunks := openai.IterSSEChunks(r.Context(), upstreamBody, &rawUpstream)
-	var downstreamAborted atomic.Bool
 	var downstreamChunks []string
-
-	streamer := stream.NewStreamer(r.Context(), chunks, requestData, inputTokens, cfg.EnableThinking, session,
-		&stream.Options{
-			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
-			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
-			MidStreamRetry:      midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey),
-		})
 
 	// terminationReason is written by the pump goroutine (stream error
 	// branch) and the select loop (client-abort branch) and read by
@@ -789,6 +801,50 @@ func writeEvent(w http.ResponseWriter, flusher http.Flusher, event string, downs
 	*downstreamChunks = append(*downstreamChunks, event)
 	_, _ = io.WriteString(w, event)
 	flusher.Flush()
+}
+
+// writeNonStreamMessages drains the translated stream and answers ONE
+// Anthropic Message JSON for non-streaming /v1/messages clients. Upstream
+// stays streaming (usage accounting needs it) — only the downstream side
+// aggregates. A mid-stream failure becomes an Anthropic error JSON; partial
+// content is dropped, same as an API failure after the fact.
+func writeNonStreamMessages(w http.ResponseWriter, r *http.Request, session *dump.Session, requestStart time.Time, ttfb int64, upstreamHeaders map[string]string, upstreamStatus int, streamer *stream.Streamer, rawUpstream *strings.Builder) {
+	var events []string
+	for ev := range streamer.Events() {
+		events = append(events, ev)
+	}
+
+	finish := func(status int, body any, reason dump.TerminationReason) {
+		term := &dump.Termination{Reason: reason}
+		if reason == dump.ClientAbort {
+			term.DisconnectTime = time.Now().UTC().Format(time.RFC3339)
+		}
+		session.WriteUpstreamResponse(upstreamHeaders, upstreamStatus, rawUpstream.String(), term)
+		session.WriteDownstreamResponse(nil, status, jsonString(body), term)
+		session.SetTiming(ttfb, time.Since(requestStart).Milliseconds())
+		session.Finish()
+	}
+
+	if r.Context().Err() != nil {
+		finish(499, nil, dump.ClientAbort)
+		return
+	}
+	if err := streamer.Err(); err != nil {
+		errType := "api_error"
+		switch e := err.(type) {
+		case *stream.UpstreamAbortedError:
+			errType = "overloaded_error"
+		case *stream.UpstreamStreamError:
+			errType = sse.MapErrorType(int(e.Code))
+		}
+		body := errorBody(errType, err.Error())
+		finish(http.StatusBadGateway, body, dump.UpstreamAbort)
+		writeJSON(w, http.StatusBadGateway, body)
+		return
+	}
+	msg := sse.AggregateMessage(events)
+	finish(http.StatusOK, msg, dump.Completed)
+	writeJSON(w, http.StatusOK, msg)
 }
 
 // handleUpstreamConnectError handles a client.Do failure (port of the TS

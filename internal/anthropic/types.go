@@ -212,6 +212,11 @@ type MessagesRequest struct {
 	Tools         []map[string]any
 	ToolChoice    any
 	ServerTools   []map[string]any
+	// Stream is the downstream `stream` flag: nil/false → the client expects
+	// ONE aggregated Message JSON (Anthropic default); true → SSE. Claude
+	// Code's model-validation probe and side queries call create()
+	// non-streaming and read message.usage directly.
+	Stream *bool
 }
 
 // UnmarshalJSON decodes the whole request with UseNumber, extracts the typed
@@ -235,6 +240,9 @@ func (r *MessagesRequest) UnmarshalJSON(data []byte) error {
 	out.StopSequences = toStringSlice(raw["stop_sequences"])
 	out.Tools = toAnyMapSlice(raw["tools"])
 	out.ServerTools = toAnyMapSlice(raw["server_tools"])
+	if b, ok := raw["stream"].(bool); ok {
+		out.Stream = &b
+	}
 	*r = out
 	return nil
 }

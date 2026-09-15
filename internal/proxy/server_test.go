@@ -276,7 +276,7 @@ func TestAuthTokenRequired(t *testing.T) {
 	cfg.AuthToken = "secret"
 	h := NewHandler(cfg)
 
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 	if resp.StatusCode != 401 {
 		t.Fatalf("401 expected, got %d", resp.StatusCode)
 	}
@@ -363,7 +363,7 @@ func TestInvalidJSONAndModel(t *testing.T) {
 func TestUpstreamErrorMapping(t *testing.T) {
 	up := mockUpstream(t, `{"error":"rate limited"}`, 429)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 	if resp.StatusCode != 429 {
 		t.Fatalf("429 expected, got %d", resp.StatusCode)
 	}
@@ -390,7 +390,7 @@ func TestFullStreamingFlow(t *testing.T) {
 		"data: [DONE]\n\n"
 	up := mockUpstream(t, upstreamBody, 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("ct = %q", ct)
@@ -452,7 +452,7 @@ func TestUpstreamIncludesStreamOptions(t *testing.T) {
 	}))
 	defer up.Close()
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -555,7 +555,7 @@ func TestDumpWiring(t *testing.T) {
 	cfg := testConfig(up.URL)
 	cfg.DumpDir = t.TempDir()
 	h := NewHandler(cfg)
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -584,7 +584,7 @@ func typicalUpstreamSSE() string {
 func TestTypicalStreamFullLifecycle(t *testing.T) {
 	up := mockUpstream(t, typicalUpstreamSSE(), 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -623,7 +623,7 @@ func TestLongStreamNoDroppedEvents(t *testing.T) {
 
 	up := mockUpstream(t, strings.Join(chunks, ""), 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	for i := 0; i < eventCount; i++ {
 		if !strings.Contains(string(body), "chunk"+strconv.Itoa(i)) {
@@ -645,7 +645,7 @@ func TestLongStreamNoDroppedEvents(t *testing.T) {
 func TestStreamCompletesNotStalls(t *testing.T) {
 	up := mockUpstream(t, typicalUpstreamSSE(), 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	events := parseSSE(t, string(body))
 	if len(events) <= 3 {
@@ -668,7 +668,7 @@ func TestUpstreamAbortSurfacesStreamError(t *testing.T) {
 	goodPrefix := "data: {\"id\":\"chatcmpl-err\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
 	up := mockUpstreamAbort(t, goodPrefix)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -707,7 +707,7 @@ func TestUpstreamAbortSurfacesStreamError(t *testing.T) {
 func TestErrorEventAfterConnectionDrop(t *testing.T) {
 	up := mockUpstreamAbort(t, "data: {\"id\":\"chatcmpl-conn\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n")
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 	if !strings.Contains(s, "Hello") {
@@ -733,7 +733,7 @@ func TestErrorEventAfterEmbeddedError(t *testing.T) {
 		"data: {\"id\":\"chatcmpl-err\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"error\":{\"message\":\"Server overloaded\",\"code\":529},\"choices\":[]}\n\n"
 	up := mockUpstream(t, sseBody, 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 	if !strings.Contains(s, "partial output") {
@@ -759,7 +759,7 @@ func TestErrorEventAfterStall(t *testing.T) {
 	// response_stalled path.
 	up := mockUpstream(t, "data: {\"id\":\"chatcmpl-stall\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"stalled output\"},\"finish_reason\":null}]}\n\n", 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 	if !strings.Contains(s, "stalled output") {
@@ -785,7 +785,7 @@ func TestDoneWithoutFinishReasonGraceful(t *testing.T) {
 		"data: [DONE]\n\n"
 	up := mockUpstream(t, sseBody, 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	events := parseSSE(t, string(body))
 	types := eventTypes(events)
@@ -814,7 +814,7 @@ func TestCRLFHandling(t *testing.T) {
 		"data: [DONE]\r\n\r\n"
 	up := mockUpstream(t, crlfSse, 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	types := eventTypes(parseSSE(t, string(body)))
 	if !contains(types, "message_start") || !contains(types, "message_stop") {
@@ -838,7 +838,7 @@ func TestSplitReadFrames(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	h := NewHandler(testConfig(srv.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	types := eventTypes(parseSSE(t, string(body)))
 	if !contains(types, "message_stop") {
@@ -857,7 +857,7 @@ func TestDownstreamAbortStopsPump(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, ctx)
+	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, ctx)
 
 	// Wait for several chunks to be flushed (and thus written to the
 	// recorder), then cancel like a disconnecting client.
@@ -892,7 +892,7 @@ func TestClientAbortBeforeUpstreamResponds(t *testing.T) {
 	h := NewHandler(cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, ctx)
+	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, ctx)
 
 	// Wait until the request is in-flight at the upstream, then abort the
 	// client connection (cancels the request context, propagated to the
@@ -936,7 +936,7 @@ func TestDumpFinalizedOnMidStreamError(t *testing.T) {
 	cfg := testConfig(up.URL)
 	cfg.DumpDir = t.TempDir()
 	h := NewHandler(cfg)
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 	if !strings.Contains(s, "Connection closed mid-response. The response above may be incomplete") {
@@ -963,7 +963,7 @@ func TestUpstreamAbortWithContentCategorized(t *testing.T) {
 	cfg := testConfig(up.URL)
 	cfg.DumpDir = t.TempDir()
 	h := NewHandler(cfg)
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	s := string(body)
 
@@ -1016,7 +1016,7 @@ func TestClientAbortCategorized(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, ctx)
+	rec, done := startPost(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, ctx)
 
 	waitFor(t, "content to flow", 5*time.Second, func() bool {
 		return flushed() >= 3 && strings.Contains(rec.body(), "message_start")
@@ -1062,7 +1062,7 @@ func TestPreserveCallerStreamOptions(t *testing.T) {
 	cfg := testConfig(up.URL)
 	cfg.ModelOverrides = []config.ModelOverride{{Pattern: "*", Extra: map[string]any{"stream_options": map[string]any{"count_tokens": true}}}}
 	h := NewHandler(cfg)
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	io.Copy(io.Discard, resp.Body)
 	so, _ := gotBody["stream_options"].(map[string]any)
 	if so == nil || so["include_usage"] != true {
@@ -1120,7 +1120,7 @@ func TestRealInputTokensEndToEnd(t *testing.T) {
 		"data: [DONE]\n\n"
 	up := mockUpstream(t, sseBody, 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`, map[string]string{"x-api-key": "test-key"})
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":true}`, map[string]string{"x-api-key": "test-key"})
 	body, _ := io.ReadAll(resp.Body)
 	events := parseSSE(t, string(body))
 	delta := eventData(events, "message_delta")
@@ -1143,6 +1143,118 @@ func TestRealInputTokensEndToEnd(t *testing.T) {
 	}
 }
 
+// ---- non-streaming /v1/messages (stream omitted or false) ----
+
+const nonStreamUpstreamSSE = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Checking.\"}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"Read:0\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\"}}]}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.ts\\\"}\"}}]}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":30,\"cache_write_tokens\":10}}}\n\n" +
+	"data: [DONE]\n\n"
+
+// The model-validation probe (and every SDK side query) calls
+// messages.create() NON-streaming and reads message.usage.input_tokens
+// directly. Answering SSE here crashed Claude Code with "Unable to validate
+// model: undefined is not an object (evaluating 'xt.usage.input_tokens')".
+func TestNonStreamMessagesAggregatesJSON(t *testing.T) {
+	up := mockUpstream(t, nonStreamUpstreamSSE, 200)
+	h := NewHandler(testConfig(up.URL))
+	// Field omitted entirely, like the probe: {"model":..,"max_tokens":1,...}
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"max_tokens":1}`, map[string]string{"x-api-key": "test-key"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json (SSE leaked to a non-streaming client)", ct)
+	}
+	var msg map[string]any
+	if err := json.Unmarshal([]byte(readBody(t, resp)), &msg); err != nil {
+		t.Fatalf("non-JSON body: %v", err)
+	}
+	if msg["type"] != "message" || msg["role"] != "assistant" || msg["model"] != "gpt-4o" {
+		t.Errorf("bad envelope: %v", msg)
+	}
+	if msg["stop_reason"] != "tool_use" {
+		t.Errorf("stop_reason = %v, want tool_use", msg["stop_reason"])
+	}
+	// The crash field: usage must be present with the real upstream counts.
+	usage, _ := msg["usage"].(map[string]any)
+	if usage == nil {
+		t.Fatalf("usage missing: %v", msg)
+	}
+	if usage["input_tokens"] != float64(60) { // 100 - 30 cached - 10 cache_write
+		t.Errorf("input_tokens = %v", usage["input_tokens"])
+	}
+	if usage["output_tokens"] != float64(7) {
+		t.Errorf("output_tokens = %v", usage["output_tokens"])
+	}
+	content, _ := msg["content"].([]any)
+	if len(content) != 3 {
+		t.Fatalf("content blocks = %d, want thinking+text+tool_use: %v", len(content), content)
+	}
+	thinking, _ := content[0].(map[string]any)
+	// No signature: the stream layer closes a switched thinking block without
+	// a signature_delta (Builder.EnsureTextBlock), so the aggregate matches
+	// what an SSE client would have assembled.
+	if thinking["type"] != "thinking" || thinking["thinking"] != "Checking." {
+		t.Errorf("thinking block = %v", thinking)
+	}
+	if _, has := thinking["signature"]; has {
+		t.Errorf("thinking signature fabricated: %v", thinking)
+	}
+	text, _ := content[1].(map[string]any)
+	if text["type"] != "text" || text["text"] != "Hi there" {
+		t.Errorf("text block = %v", text)
+	}
+	tool, _ := content[2].(map[string]any)
+	if tool["type"] != "tool_use" || tool["name"] != "Read" {
+		t.Errorf("tool block = %v", tool)
+	}
+	input, _ := tool["input"].(map[string]any)
+	if input["file_path"] != "a.ts" {
+		t.Errorf("tool input = %v (partial-json fragments not concatenated?)", input)
+	}
+}
+
+// stream:false must aggregate exactly like an omitted field.
+func TestNonStreamExplicitFalseAggregatesJSON(t *testing.T) {
+	up := mockUpstream(t, nonStreamUpstreamSSE, 200)
+	h := NewHandler(testConfig(up.URL))
+	resp := postMessages(t, h, `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"max_tokens":1,"stream":false}`, map[string]string{"x-api-key": "test-key"})
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var msg map[string]any
+	if err := json.Unmarshal([]byte(readBody(t, resp)), &msg); err != nil {
+		t.Fatalf("non-JSON body: %v", err)
+	}
+	if msg["usage"] == nil {
+		t.Errorf("usage missing: %v", msg)
+	}
+}
+
+// A mid-stream upstream death on a non-streaming request must surface as an
+// Anthropic error JSON (the client has no SSE reader to parse an error event).
+func TestNonStreamUpstreamAbortReturnsErrorJSON(t *testing.T) {
+	up := mockUpstreamAbort(t, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n")
+	h := NewHandler(testConfig(up.URL))
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`, nil)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(readBody(t, resp)), &body); err != nil {
+		t.Fatalf("non-JSON body: %v", err)
+	}
+	if body["type"] != "error" {
+		t.Errorf("body = %v", body)
+	}
+}
+
 func TestServerToolsPassthroughNot400(t *testing.T) {
 	up := mockUpstream(t, "data: [DONE]\n\n", 200)
 	h := NewHandler(testConfig(up.URL))
@@ -1160,7 +1272,7 @@ func TestServerToolsPassthroughNot400(t *testing.T) {
 func TestEmptyUpstreamBody500(t *testing.T) {
 	up := mockUpstream(t, "", 200)
 	h := NewHandler(testConfig(up.URL))
-	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, nil)
+	resp := postMessages(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 	if resp.StatusCode != 500 {
 		t.Fatalf("500 expected, got %d", resp.StatusCode)
 	}
@@ -1384,7 +1496,7 @@ func TestEmptyTurnGuardRetriesUpstreamAndContinuesMessage(t *testing.T) {
 	h := NewHandler(cfg)
 
 	resp := postMessages(t, h,
-		`{"model":"kimi-k3","tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"investigate"}]}`,
+		`{"model":"kimi-k3","stream":true,"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"investigate"}]}`,
 		nil)
 	defer resp.Body.Close()
 	events := parseSSE(t, mustReadAll(t, resp))
