@@ -5,6 +5,11 @@
 //
 // The hook never fails the downstream request: a captioning failure degrades
 // to the same placeholder text the eviction hook uses.
+//
+// Both downstream dialects are covered: Apply handles Anthropic Messages
+// requests via the hook registry, CaptionItems handles OpenAI Responses input
+// items (the Responses path cannot share the registry because its request
+// shape is not Anthropic-canonical).
 package caption
 
 import (
@@ -14,6 +19,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/config"
 	"github.com/chinfeng/chat-to-messages/internal/convert"
 	"github.com/chinfeng/chat-to-messages/internal/hook"
+	"github.com/chinfeng/chat-to-messages/internal/responses"
 )
 
 // placeholder mirrors the eviction hook's fallback so a captioning failure
@@ -51,47 +57,109 @@ func (h *Hook) Applies(model string) bool {
 	return hook.AnyMatch(h.patterns, model)
 }
 
-// Apply replaces every upstream-visible image in the request with a captioned
-// text block: user image blocks, base64 image documents, and images nested in
-// tool_result content (which the converter later moves to a synthetic user
-// turn). Non-image documents are left to the converter's existing handling.
+// Apply replaces every upstream-visible image in an Anthropic Messages request
+// with a captioned text block: user image blocks, base64 image documents, and
+// images nested in tool_result content (which the converter later moves to a
+// synthetic user turn). Non-image documents are left to the converter's
+// existing handling.
 func (h *Hook) Apply(ctx context.Context, req *hook.Request) error {
 	refs := convert.EnumerateImageRefs(req.Messages)
 	if len(refs) == 0 {
 		return nil
 	}
-
-	captions := h.captions(ctx, refs)
+	parts := make([]map[string]any, len(refs))
 	for i, ref := range refs {
-		text := captions[i]
-		if text == "" {
-			// Batch failure or a vision reply that did not parse: degrade
-			// every image to the placeholder so the model gets a coherent
-			// (if empty) view rather than half-captioned context.
-			text = placeholder
+		parts[i] = ref.Part
+	}
+	captions := h.captionParts(ctx, parts)
+	for i, ref := range refs {
+		text := captionText(captions[i], i+1, len(refs), partMime(ref.Part))
+		if captions[i] == "" {
 			h.logf("model %s: caption failed for image %d/%d, using placeholder", req.Model, i+1, len(refs))
-		} else {
-			text = fmt.Sprintf("[Image %d/%d (%s)] %s", i+1, len(refs), partMime(ref.Part), text)
 		}
 		convert.ReplaceImageRef(req.Messages, ref, text)
 	}
 	return nil
 }
 
-// captions returns one caption per ref, "" for each image that could not be
-// captioned. Misses are captioned in a single batched vision call; hits come
-// from the cache.
-func (h *Hook) captions(ctx context.Context, refs []convert.ImageRef) []string {
-	out := make([]string, len(refs))
+// CaptionItems replaces every input_image part in an OpenAI Responses input
+// item list with a captioned input_text part, in place. It covers both the
+// current request's items and the previous_response_id-expanded history:
+// buildResponsesUpstream runs it on the fully assembled history slice, before
+// BuildChatBody turns the items into chat messages. Items without image parts
+// are untouched; a caption failure degrades to the placeholder text.
+//
+// The store keeps the ORIGINAL items (with images), so a later turn
+// re-captions from cache — or, if the operator later rules the model visual,
+// replays the image untouched.
+func (h *Hook) CaptionItems(ctx context.Context, model string, items []responses.Item) error {
+	if !h.Applies(model) || len(items) == 0 {
+		return nil
+	}
+	type imgPos struct {
+		itemIdx int
+		partIdx int
+	}
+	var positions []imgPos
+	var parts []map[string]any
+	for i := range items {
+		it := &items[i]
+		if it.Content.IsString {
+			continue
+		}
+		for j := range it.Content.Parts {
+			p := &it.Content.Parts[j]
+			if p.Type == "input_image" && p.ImageURL != "" {
+				img := map[string]any{"url": p.ImageURL}
+				if p.Detail != "" {
+					img["detail"] = p.Detail
+				}
+				positions = append(positions, imgPos{i, j})
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": img})
+			}
+		}
+	}
+	if len(positions) == 0 {
+		return nil
+	}
+
+	captions := h.captionParts(ctx, parts)
+	for k, pos := range positions {
+		text := captionText(captions[k], k+1, len(positions), partMime(parts[k]))
+		if captions[k] == "" {
+			h.logf("model %s: caption failed for image %d/%d, using placeholder", model, k+1, len(positions))
+		}
+		items[pos.itemIdx].Content.Parts[pos.partIdx] = responses.ContentPart{
+			Type: "input_text",
+			Text: text,
+		}
+	}
+	return nil
+}
+
+// captionText formats a caption into the replacement text block, or the
+// placeholder when captioning failed.
+func captionText(caption string, idx, total int, mime string) string {
+	if caption == "" {
+		return placeholder
+	}
+	return fmt.Sprintf("[Image %d/%d (%s)] %s", idx, total, mime, caption)
+}
+
+// captionParts returns one caption per OpenAI image_url part, "" for each
+// image that could not be captioned. Cache misses are captioned in a single
+// batched vision call; hits come from the cache.
+func (h *Hook) captionParts(ctx context.Context, parts []map[string]any) []string {
+	out := make([]string, len(parts))
 	var missIdx []int
 	var missParts []map[string]any
-	for i, ref := range refs {
-		if cap, ok := h.cache.get(cacheKey(ref.Part)); ok {
+	for i, p := range parts {
+		if cap, ok := h.cache.get(cacheKey(p)); ok {
 			out[i] = cap
 			continue
 		}
 		missIdx = append(missIdx, i)
-		missParts = append(missParts, ref.Part)
+		missParts = append(missParts, p)
 	}
 	if len(missParts) == 0 {
 		return out

@@ -13,6 +13,7 @@ import (
 
 	"github.com/chinfeng/chat-to-messages/internal/config"
 	"github.com/chinfeng/chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/hook/caption"
 	"github.com/chinfeng/chat-to-messages/internal/openai"
 	"github.com/chinfeng/chat-to-messages/internal/responses"
 	"github.com/chinfeng/chat-to-messages/internal/ws"
@@ -33,7 +34,7 @@ type wsClientEnvelope struct {
 // event per text frame, plus {type:"error",status,error:{...}} frames for
 // request-level failures. One response at a time per connection (clients
 // serialize turns; a second create while busy gets an error frame).
-func handleResponsesWS(w http.ResponseWriter, r *http.Request, cfg *config.Config, store *responses.Store) {
+func handleResponsesWS(w http.ResponseWriter, r *http.Request, cfg *config.Config, store *responses.Store, imageHook *caption.Hook) {
 	// Pre-upgrade failures answer plain HTTP, same as the SSE transport.
 	if !validateAuthToken(r, cfg) {
 		writeJSON(w, http.StatusUnauthorized, openAIError("authentication_error", "Invalid auth token. Provide correct x-api-key header."))
@@ -103,7 +104,7 @@ func handleResponsesWS(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 			payload := msg.Payload
 			go func() {
 				defer clearJob()
-				runResponsesWSJob(ctx, cfg, store, conn, payload, generate, apiKey)
+				runResponsesWSJob(ctx, cfg, store, conn, payload, generate, apiKey, imageHook)
 			}()
 		case "response.cancel":
 			// Cooperative stop: the job's upstream read aborts and the
@@ -129,7 +130,7 @@ func handleResponsesWS(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 // chat/completions → translate → one text frame per Responses event.
 // Mirrors handleResponses with HTTP status/JSON answers swapped for error
 // frames. Dump bookkeeping is per-create (one session each).
-func runResponsesWSJob(ctx context.Context, cfg *config.Config, store *responses.Store, conn *ws.Conn, frame []byte, generate bool, apiKey string) {
+func runResponsesWSJob(ctx context.Context, cfg *config.Config, store *responses.Store, conn *ws.Conn, frame []byte, generate bool, apiKey string, imageHook *caption.Hook) {
 	session := dump.NewSession(cfg.DumpDir)
 	requestStart := time.Now()
 
@@ -150,7 +151,7 @@ func runResponsesWSJob(ctx context.Context, cfg *config.Config, store *responses
 		return
 	}
 
-	up, err := buildResponsesUpstream(ctx, cfg, store, &req, apiKey)
+	up, err := buildResponsesUpstream(ctx, cfg, store, &req, apiKey, imageHook)
 	if err != nil {
 		session.Finish()
 		if ae, ok := err.(*responses.APIError); ok {

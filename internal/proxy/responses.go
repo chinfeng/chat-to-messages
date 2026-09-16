@@ -13,6 +13,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/config"
 	"github.com/chinfeng/chat-to-messages/internal/convert"
 	"github.com/chinfeng/chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/hook/caption"
 	"github.com/chinfeng/chat-to-messages/internal/openai"
 	"github.com/chinfeng/chat-to-messages/internal/responses"
 )
@@ -22,7 +23,7 @@ import (
 // OpenAI Responses dialect in, chat/completions out, Responses SSE back.
 // Error bodies are OpenAI-flavored ({"error":{message,type,param}}) since the
 // client speaks that dialect here.
-func handleResponses(w http.ResponseWriter, r *http.Request, cfg *config.Config, store *responses.Store) {
+func handleResponses(w http.ResponseWriter, r *http.Request, cfg *config.Config, store *responses.Store, imageHook *caption.Hook) {
 	session := dump.NewSession(cfg.DumpDir)
 	requestStart := time.Now()
 	requestDatetime := time.Now().UTC().Format(time.RFC3339)
@@ -69,7 +70,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request, cfg *config.Config,
 
 	// Expand previous_response_id, convert, and build the upstream request
 	// (shared with the websocket transport — see responses_ws.go).
-	up, err := buildResponsesUpstream(r.Context(), cfg, store, &req, apiKey)
+	up, err := buildResponsesUpstream(r.Context(), cfg, store, &req, apiKey, imageHook)
 	if err != nil {
 		session.Finish()
 		if ae, ok := err.(*responses.APIError); ok {
@@ -284,7 +285,11 @@ type responsesUpstream struct {
 // (400/404); anything else is a plain error the caller maps to 500.
 // Shared by the SSE transport (handleResponses) and the websocket transport
 // (responses_ws.go).
-func buildResponsesUpstream(ctx context.Context, cfg *config.Config, store *responses.Store, req *responses.Request, apiKey string) (*responsesUpstream, error) {
+//
+// imageHook, when non-nil and applicable to the request's model, captions the
+// input_image parts across the assembled history (current input + stored
+// chain) before conversion. It runs here so both transports get it.
+func buildResponsesUpstream(ctx context.Context, cfg *config.Config, store *responses.Store, req *responses.Request, apiKey string, imageHook *caption.Hook) (*responsesUpstream, error) {
 	// Expand previous_response_id through the proxy store. The full
 	// conversation lives client-side otherwise; a missing entry is a 404,
 	// never a silent restart (spec §响应存储).
@@ -306,6 +311,20 @@ func buildResponsesUpstream(ctx context.Context, cfg *config.Config, store *resp
 	// The current request's items trail the expanded history (BuildChatBody's
 	// ordering contract).
 	history = append(history, req.Input.Items...)
+
+	// Caption images for non-visual models before conversion: the assembled
+	// history is the full logical input, so one pass covers both the stored
+	// chain and the current turn. Only `history` is mutated — ItemsFromRaw
+	// hands back re-decoded copies, so the STORE keeps the original
+	// image-bearing items (a later turn re-captions from cache, or replays the
+	// image untouched if the model is later ruled visual) and CurrentRaw, which
+	// is what the store persists for this turn, keeps its images too.
+	if imageHook != nil {
+		if err := imageHook.CaptionItems(ctx, req.Model, history); err != nil {
+			return nil, err
+		}
+	}
+
 	var currentRaw []any
 	if req.Input.IsString {
 		if strings.TrimSpace(req.Input.Str) != "" {

@@ -145,6 +145,12 @@ func headerMap(h http.Header) map[string]string {
 func NewHandler(cfg *config.Config) http.Handler {
 	responsesStore := responses.NewStore(time.Duration(cfg.ResponsesStoreTTLMinutes) * time.Minute)
 	hooks := buildHookRegistry(cfg)
+	// The caption hook also serves the Responses dialect directly (the registry
+	// is Anthropic-canonical); nil when the operator did not configure it.
+	var imageCaption *caption.Hook
+	if len(cfg.HookImageCaptionPatterns) > 0 {
+		imageCaption = caption.New(cfg)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -154,13 +160,14 @@ func NewHandler(cfg *config.Config) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		handleRequest(w, r, cfg, responsesStore, hooks)
+		handleRequest(w, r, cfg, responsesStore, hooks, imageCaption)
 	})
 }
 
-// buildHookRegistry wires the request hooks: eviction first (it removes the
-// oldest images so downstream image hooks see a bounded request), then the
-// caption hook when the operator has configured non-visual model globs.
+// buildHookRegistry wires the request hooks for the Anthropic Messages
+// dialect: eviction first (it removes the oldest images so downstream image
+// hooks see a bounded request), then the caption hook when the operator has
+// configured non-visual model globs.
 func buildHookRegistry(cfg *config.Config) *hook.Registry {
 	r := hook.NewRegistry()
 	r.Register(&hook.EvictionHook{Keep: cfg.MaxUpstreamImages})
@@ -171,18 +178,18 @@ func buildHookRegistry(cfg *config.Config) *hook.Registry {
 }
 
 // handleRequest routes a request (port of routeRequest() in routes.ts).
-func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, responsesStore *responses.Store, hooks *hook.Registry) {
+func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, responsesStore *responses.Store, hooks *hook.Registry, imageCaption *caption.Hook) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
 		handleMessages(w, r, cfg, hooks)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
-		handleResponses(w, r, cfg, responsesStore)
+		handleResponses(w, r, cfg, responsesStore, imageCaption)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/responses":
 		// OpenAI websocket mode: same dialect, upgrade instead of POST.
 		if ws.IsUpgrade(r) {
-			handleResponsesWS(w, r, cfg, responsesStore)
+			handleResponsesWS(w, r, cfg, responsesStore, imageCaption)
 		} else {
 			writeJSON(w, http.StatusBadRequest, openAIError("invalid_request_error", "GET /v1/responses requires a websocket upgrade (use POST for SSE)."))
 		}

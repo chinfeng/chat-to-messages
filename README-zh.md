@@ -321,7 +321,7 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 - **每请求一次批量调用**：当前请求中所有未缓存的图片放进同一个消息发给视觉模型，要求其按编号逐张描述。
 - **按内容哈希缓存**（`--image-caption-cache-ttl`，默认 24h）：多轮对话、重试、`previous_response_id` 历史展开时重放同一张图片只付一次描述成本。
 - **失败只降级、不阻断**：视觉调用失败或回复无法解析时，图片回退为与 `--max-upstream-images` 相同的文本占位符，请求照常进行。
-- hook 在图片裁剪之后、转换之前执行，目前仅作用于 `/v1/messages`。
+- hook 在图片裁剪之后、转换之前执行，同时作用于 `/v1/messages` 与 `/v1/responses`（含 `previous_response_id` 展开的历史与 websocket 传输）。
 
 ### 透传模式
 

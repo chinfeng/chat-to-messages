@@ -321,7 +321,7 @@ Details:
 - **One batched call per request**: all of a request's uncaptioned images are sent to the vision model in a single message, one numbered description per image in the reply.
 - **Cached by content hash** (`--image-caption-cache-ttl`, default 24h): a multi-turn conversation, a retry, or a `previous_response_id` expansion that replays the same image pays for one caption.
 - **Failure degrades, never breaks**: if the vision call fails or the reply does not parse, the images fall back to the same text placeholder `--max-upstream-images` uses, and the request proceeds.
-- The hook runs after eviction and before conversion, on `/v1/messages` only.
+- The hook runs after eviction and before conversion, on both `/v1/messages` and `/v1/responses` (including the `previous_response_id`-expanded history and the websocket transport).
 
 ### Passthrough Mode
 
