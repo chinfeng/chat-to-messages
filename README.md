@@ -138,7 +138,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--sanitize-client-meta-turns` | `true` | Normalize Claude Code's synthetic user turns (`[Your previous response had no visible output...]`, `(no content)`, interruption markers) before replaying them upstream |
 | `--empty-turn-guard` | `true` | Retry the upstream request when a turn ends with reasoning but no visible text and no tool call (kimi-k3/GLM collapse guard) |
 | `--empty-turn-retries` | `2` | Max empty-turn retry attempts per request (0-5) |
-| `--mid-stream-stall-timeout` | `60` | Close the upstream connection after this many seconds of silence and retry once into the same SSE message (newapi/GLM relay kills long plan generations; dumped 2026-09-13). `0` disables |
+| `--mid-stream-stall-timeout` | `120` | Close the upstream connection after this many seconds of silence and retry once into the same SSE message (newapi/GLM relay kills long plan generations; dumped 2026-09-13). `0` disables |
 | `--max-upstream-images` | `7` | Cap on images sent upstream per request; older images (earliest first) are replaced with text placeholders (z-ai deterministically fails at >= 8). `0` disables eviction |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--reasoning-replay` | `think_tags` | How assistant thinking blocks are replayed upstream: `think_tags`, `reasoning_content`, or `disabled`. Accepts a bare mode (global default) or `glob=mode` per-model rules (repeatable, first match wins); see below |

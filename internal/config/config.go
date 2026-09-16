@@ -272,10 +272,10 @@ func Load(args []string) *Config {
 	}
 
 	// Mid-stream stall window: negative is a typo — fall back to the default.
-	midStreamStall := parseInt(getArg("mid-stream-stall-timeout", "60"))
+	midStreamStall := parseInt(getArg("mid-stream-stall-timeout", "120"))
 	if midStreamStall < 0 {
-		warn("Invalid --mid-stream-stall-timeout %d (must be >= 0); using 60", midStreamStall)
-		midStreamStall = 60
+		warn("Invalid --mid-stream-stall-timeout %d (must be >= 0); using 120", midStreamStall)
+		midStreamStall = 120
 	}
 
 	return &Config{
