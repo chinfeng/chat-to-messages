@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Reasoning replay modes accepted by --reasoning-replay. String values mirror
@@ -105,6 +106,23 @@ type Config struct {
 	// deterministically fails requests carrying >= 8 images (dumped
 	// 2026-09-12); default 7, 0 disables eviction.
 	MaxUpstreamImages int
+
+	// HookImageCaptionPatterns are the model globs the image-caption request
+	// hook applies to (--hook-image-caption, repeatable, any match applies).
+	// Empty disables the hook entirely.
+	HookImageCaptionPatterns []string
+	// ImageCaptionModel is the vision model asked to caption images for
+	// non-visual models. Required when HookImageCaptionPatterns is non-empty.
+	ImageCaptionModel string
+	// ImageCaptionBaseURL / ImageCaptionAPIKey select a dedicated vision
+	// upstream; when empty the main upstream is reused with only the model
+	// overridden.
+	ImageCaptionBaseURL string
+	ImageCaptionAPIKey  string
+	// ImageCaptionCacheTTL bounds how long a caption is reused for an image
+	// (keyed by content hash) across turns, retries, and response-store
+	// expansion. 0 disables caching.
+	ImageCaptionCacheTTL time.Duration
 }
 
 // warn mirrors console.warn (stderr, no timestamp).
@@ -278,6 +296,30 @@ func Load(args []string) *Config {
 		midStreamStall = 120
 	}
 
+	// Image-caption request hook: glob patterns naming the models the hook
+	// applies to (repeatable, any match applies). The hook is inert without
+	// --image-caption-model, so a configured-but-model-less hook is a startup
+	// error rather than a per-request failure.
+	var captionPatterns []string
+	for _, raw := range getMultiArg("hook-image-caption") {
+		if p := strings.TrimSpace(raw); p != "" {
+			captionPatterns = append(captionPatterns, p)
+		}
+	}
+	captionModel := getArg("image-caption-model", "")
+	if len(captionPatterns) > 0 && captionModel == "" {
+		fmt.Fprintln(os.Stderr, "fatal: --hook-image-caption requires --image-caption-model (the vision model that captions images)")
+		os.Exit(1)
+	}
+
+	// Caption cache TTL: unparsable values fall back to the 24h default; "0"
+	// disables caching.
+	captionTTL, err := time.ParseDuration(getArg("image-caption-cache-ttl", "24h"))
+	if err != nil {
+		warn("Invalid --image-caption-cache-ttl %q (want a duration like 24h or 0); using 24h", getArg("image-caption-cache-ttl", ""))
+		captionTTL = 24 * time.Hour
+	}
+
 	return &Config{
 		UpstreamBaseURL:          getArg("upstream-base-url", "https://api.openai.com/v1"),
 		UpstreamAPIKey:           getArg("upstream-api-key", ""),
@@ -295,6 +337,11 @@ func Load(args []string) *Config {
 		MidStreamStallTimeout:    midStreamStall,
 		ResponsesStoreTTLMinutes: parseInt(getArg("responses-store-ttl-minutes", "1440")),
 		MaxUpstreamImages:        maxUpstreamImages,
+		HookImageCaptionPatterns: captionPatterns,
+		ImageCaptionModel:        captionModel,
+		ImageCaptionBaseURL:      getArg("image-caption-base-url", ""),
+		ImageCaptionAPIKey:       getArg("image-caption-api-key", ""),
+		ImageCaptionCacheTTL:     captionTTL,
 	}
 }
 

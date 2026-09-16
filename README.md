@@ -140,6 +140,11 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--empty-turn-retries` | `2` | Max empty-turn retry attempts per request (0-5) |
 | `--mid-stream-stall-timeout` | `120` | Close the upstream connection after this many seconds of silence and retry once into the same SSE message (newapi/GLM relay kills long plan generations; dumped 2026-09-13). `0` disables |
 | `--max-upstream-images` | `7` | Cap on images sent upstream per request; older images (earliest first) are replaced with text placeholders (z-ai deterministically fails at >= 8). `0` disables eviction |
+| `--hook-image-caption` | — | Model glob the image-caption request hook applies to (repeatable, any match applies). For these models, images are replaced with vision-model captions before the upstream request is built; see below |
+| `--image-caption-model` | — | Vision model that captions images for `--hook-image-caption` models (required when the hook is enabled) |
+| `--image-caption-base-url` | — | Dedicated vision upstream base URL; when omitted, the main upstream is reused with only the model overridden |
+| `--image-caption-api-key` | — | Dedicated vision upstream API key; when omitted, the main upstream key is reused |
+| `--image-caption-cache-ttl` | `24h` | How long a caption is reused for the same image across turns/retries; `0` disables caching |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--reasoning-replay` | `think_tags` | How assistant thinking blocks are replayed upstream: `think_tags`, `reasoning_content`, or `disabled`. Accepts a bare mode (global default) or `glob=mode` per-model rules (repeatable, first match wins); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
@@ -295,6 +300,29 @@ Controls how the proxy replays assistant thinking blocks back to the upstream mo
 
 **Why per model:** Kimi's API requires assistant tool-call messages to carry `reasoning_content` when thinking is enabled; replaying them without it renders out-of-distribution history and manifests as the model emitting its reasoning as text and ending the turn without any tool call. DeepSeek is the opposite — its API returns a 400 error when `reasoning_content` appears in input messages. GLM-family models are trained with `<think>` markup in context, so the default `think_tags` mode is already their native representation. Keep the default unless a model documents a different contract.
 
+### Image Caption Hook
+
+Text-only upstream models (deepseek, kimi, qwen-text, …) reject requests carrying images with a hard 400, but downstream clients like Claude Code send images routinely. The image-caption request hook fixes the mismatch without any model-capability table: you name the models the hook applies to, and for those models every image in the request is replaced with a caption produced by a vision model before the upstream request is built:
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.example.com/v1 \
+  --upstream-api-key sk-xxx \
+  --hook-image-caption 'deepseek*' \
+  --hook-image-caption 'kimi*' \
+  --image-caption-model glm-4v
+```
+
+With this, a `deepseek-*` request arrives upstream carrying `[Image 1/2 (image/png)] <vision model's description>` text blocks instead of `image_url` parts. The hook applies to every image the converter would emit: user image blocks, base64 image documents, and images nested in tool results. Non-image documents are untouched.
+
+Details:
+
+- **Same upstream, different model** is the default: only the model name is overridden. Set `--image-caption-base-url` / `--image-caption-api-key` to use a dedicated vision upstream instead.
+- **One batched call per request**: all of a request's uncaptioned images are sent to the vision model in a single message, one numbered description per image in the reply.
+- **Cached by content hash** (`--image-caption-cache-ttl`, default 24h): a multi-turn conversation, a retry, or a `previous_response_id` expansion that replays the same image pays for one caption.
+- **Failure degrades, never breaks**: if the vision call fails or the reply does not parse, the images fall back to the same text placeholder `--max-upstream-images` uses, and the request proceeds.
+- The hook runs after eviction and before conversion, on `/v1/messages` only.
+
 ### Passthrough Mode
 
 When both `--upstream-api-key` and `--auth-token` are unset, passthrough mode is automatically enabled: the key provided by the client via `x-api-key` or `Authorization` header is forwarded as-is to the upstream endpoint.
@@ -423,7 +451,7 @@ Unmatched paths return `404` with an Anthropic-format error body.
 | `redacted_thinking` block | Replayed as `[redacted thinking]` placeholder | Preserves multi-turn reasoning chain |
 | `thinking` block (signature) | Preserved as `<!--sig:...-->` prefix in thinking tags | Round-trip signature preservation for multi-turn verification |
 | `document` block | Serialized as `[Document: filename (media_type)]` text | PDF/document awareness (binary not forwarded) |
-| `image` block (base64/url) | `image_url` content part | Anthropic image blocks converted to OpenAI format |
+| `image` block (base64/url) | `image_url` content part | Anthropic image blocks converted to OpenAI format; for `--hook-image-caption` models, replaced with a captioned text block before conversion |
 
 ### Streaming SSE Event Mapping
 

@@ -3,6 +3,7 @@ package convert
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/chinfeng/chat-to-messages/internal/anthropic"
 )
@@ -25,21 +26,119 @@ func EvictOldImages(messages []anthropic.Message, keep int) int {
 	if keep <= 0 || len(messages) == 0 {
 		return 0
 	}
-	total := 0
-	for i := range messages {
-		total += countMessageImages(&messages[i])
-	}
-	evict := total - keep
+	refs := EnumerateImageRefs(messages)
+	evict := len(refs) - keep
 	if evict <= 0 {
 		return 0
 	}
-	for i := range messages {
-		if evict == 0 {
-			break
-		}
-		evict -= evictMessageImages(&messages[i], evict)
+	for _, ref := range refs[:evict] {
+		ReplaceImageRef(messages, ref, imageEvictedPlaceholder)
 	}
-	return total - keep
+	return evict
+}
+
+// ImageRef locates one image that ConvertMessages would emit upstream as an
+// image_url part. Part is that OpenAI content part (url + optional detail),
+// ready to hand to a vision model.
+type ImageRef struct {
+	Part    map[string]any
+	Message int // index into the messages slice
+	Block   int // index into the message's block list
+	Entry   int // index into a tool_result content array, -1 otherwise
+}
+
+// EnumerateImageRefs returns every image-bearing position in document order:
+// user-message image blocks, base64 image documents, and images nested in
+// tool_result content (which the converter later moves to a synthetic user
+// turn). The slice is empty when the request carries no upstream-visible
+// images.
+func EnumerateImageRefs(messages []anthropic.Message) []ImageRef {
+	var refs []ImageRef
+	for mi := range messages {
+		blocks, ok := messages[mi].Content.Blocks()
+		if !ok {
+			continue
+		}
+		for bi := range blocks {
+			block := &blocks[bi]
+			switch {
+			case block.Type == "image":
+				if part := buildImagePartFromBlock(block); part != nil {
+					refs = append(refs, ImageRef{Part: part, Message: mi, Block: bi, Entry: -1})
+				}
+			case isImageDocumentBlock(block):
+				refs = append(refs, ImageRef{
+					Part:    documentImagePart(block),
+					Message: mi, Block: bi, Entry: -1,
+				})
+			case isToolResultBlockType(block.Type):
+				entries, ok := decodeToolResultEntries(block.Content)
+				if !ok {
+					continue
+				}
+				for ei, e := range entries {
+					m, ok := e.(map[string]any)
+					if !ok {
+						continue
+					}
+					if part := buildImagePartFromMap(m); part != nil {
+						refs = append(refs, ImageRef{Part: part, Message: mi, Block: bi, Entry: ei})
+					}
+				}
+			}
+		}
+	}
+	return refs
+}
+
+// ReplaceImageRef replaces the image at ref with a text block holding text,
+// re-marshaling the tool_result content array when the image is nested. It is
+// a no-op when ref no longer points at a valid position.
+func ReplaceImageRef(messages []anthropic.Message, ref ImageRef, text string) {
+	if ref.Message < 0 || ref.Message >= len(messages) {
+		return
+	}
+	blocks, ok := messages[ref.Message].Content.Blocks()
+	if !ok || ref.Block < 0 || ref.Block >= len(blocks) {
+		return
+	}
+	block := &blocks[ref.Block]
+	if ref.Entry < 0 {
+		*block = anthropic.ContentBlock{Type: "text", Text: text}
+		return
+	}
+	entries, ok := decodeToolResultEntries(block.Content)
+	if !ok || ref.Entry < 0 || ref.Entry >= len(entries) {
+		return
+	}
+	if _, ok := entries[ref.Entry].(map[string]any); !ok {
+		return
+	}
+	entries[ref.Entry] = map[string]any{"type": "text", "text": text}
+	out, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	block.Content = out
+}
+
+// isImageDocumentBlock reports whether a document block holds a base64 image
+// the converter would emit as an image_url part.
+func isImageDocumentBlock(block *anthropic.ContentBlock) bool {
+	src := block.Source
+	return src != nil && src.Type == "base64" && isImageBase64Source(src)
+}
+
+// documentImagePart builds the OpenAI image_url part the converter emits for
+// a base64 image document block (no detail hint — the converter adds none).
+func documentImagePart(block *anthropic.ContentBlock) map[string]any {
+	src := block.Source
+	mediaType := sourceMediaType(src)
+	url := src.Data
+	if !strings.HasPrefix(url, "data:") {
+		url = "data:" + mediaType + ";base64," + url
+	}
+	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 }
 
 // countMessageImages counts the image blocks in one message that would be
@@ -88,70 +187,6 @@ func countToolResultImages(block *anthropic.ContentBlock) int {
 		}
 	}
 	return n
-}
-
-// evictMessageImages replaces up to budget images in one message with text
-// placeholders, returning the number replaced.
-func evictMessageImages(m *anthropic.Message, budget int) int {
-	blocks, ok := m.Content.Blocks()
-	if !ok {
-		return 0
-	}
-	replaced := 0
-	for i := range blocks {
-		if replaced == budget {
-			break
-		}
-		block := &blocks[i]
-		switch block.Type {
-		case "image":
-			if buildImagePartFromBlock(block) != nil {
-				*block = anthropic.ContentBlock{Type: "text", Text: imageEvictedPlaceholder}
-				replaced++
-			}
-		case "document":
-			if src := block.Source; src != nil && src.Type == "base64" && isImageBase64Source(src) {
-				*block = anthropic.ContentBlock{Type: "text", Text: imageEvictedPlaceholder}
-				replaced++
-			}
-		default:
-			if isToolResultBlockType(block.Type) {
-				replaced += evictToolResultImages(block, budget-replaced)
-			}
-		}
-	}
-	return replaced
-}
-
-// evictToolResultImages replaces up to budget image entries inside a
-// tool_result content array with text entries, re-marshaling the content
-// field. Returns the number replaced.
-func evictToolResultImages(block *anthropic.ContentBlock, budget int) int {
-	entries, ok := decodeToolResultEntries(block.Content)
-	if !ok {
-		return 0
-	}
-	replaced := 0
-	for i, e := range entries {
-		if replaced == budget {
-			break
-		}
-		m, ok := e.(map[string]any)
-		if !ok || buildImagePartFromMap(m) == nil {
-			continue
-		}
-		entries[i] = map[string]any{"type": "text", "text": imageEvictedPlaceholder}
-		replaced++
-	}
-	if replaced == 0 {
-		return 0
-	}
-	out, err := json.Marshal(entries)
-	if err != nil {
-		return 0
-	}
-	block.Content = out
-	return replaced
 }
 
 // decodeToolResultEntries decodes a tool_result content field into its

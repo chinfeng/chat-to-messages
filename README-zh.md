@@ -140,6 +140,11 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--empty-turn-retries` | `2` | 每个请求允许的空回合重试次数上限（0-5） |
 | `--mid-stream-stall-timeout` | `120` | 上游静默超过该秒数后主动断开并重试一次、在同一 SSE message 内续流（针对 newapi/GLM 中转掐断长计划生成，2026-09-13 dump）。`0` 禁用 |
 | `--max-upstream-images` | `7` | 每个请求发送到上游的图片数量上限；超出的较早图片（从最早开始）替换为文本占位符（z-ai 渠道 ≥8 张必挂）。`0` 禁用裁剪 |
+| `--hook-image-caption` | — | 图片看图请求 hook 生效的模型 glob（可重复指定，任一匹配即生效）。对这些模型，图片在构造上游请求前被视觉模型生成的描述文本替换；见下方说明 |
+| `--image-caption-model` | — | 为 `--hook-image-caption` 命中的模型生成图片描述的视觉模型（启用 hook 时必填） |
+| `--image-caption-base-url` | — | 独立视觉上游 base URL；留空时复用主上游、仅覆盖模型名 |
+| `--image-caption-api-key` | — | 独立视觉上游 API key；留空时复用主上游 key |
+| `--image-caption-cache-ttl` | `24h` | 同一图片的描述复用时长（跨多轮/重试）；`0` 禁用缓存 |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--reasoning-replay` | `think_tags` | 助手 thinking 块回放给上游的方式：`think_tags`、`reasoning_content` 或 `disabled`。接受裸模式（全局默认）或 `glob=mode` 按模型规则（可重复指定，首个匹配生效）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
@@ -295,6 +300,29 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 
 **为什么按模型区分：** Kimi 官方要求 thinking 模式下 assistant 的 tool call 消息必须携带 `reasoning_content`；缺失该字段会让模型看到分布外的历史，表现为把推理当正文输出、宣布计划后直接结束回合而不发出任何工具调用。DeepSeek 恰好相反——输入 messages 中出现 `reasoning_content` 会直接返回 400 错误。GLM 系模型在训练中就使用上下文内的 `<think>` 标记，默认 `think_tags` 模式即其原生表达。除非模型文档另有约定，请保持默认值。
 
+### 图片看图 Hook
+
+纯文本上游模型（deepseek、kimi、qwen-text 等）收到图片会直接 400 拒绝，而 Claude Code 这类下游客户端又经常发图。图片看图请求 hook 在不引入任何模型能力表的前提下解决这个错配：你指定 hook 生效的模型，对这些模型，请求中的每张图片在构造上游请求前都会被视觉模型生成的描述文本替换：
+
+```bash
+./chat-to-messages \
+  --upstream-base-url https://api.example.com/v1 \
+  --upstream-api-key sk-xxx \
+  --hook-image-caption 'deepseek*' \
+  --hook-image-caption 'kimi*' \
+  --image-caption-model glm-4v
+```
+
+配置后，`deepseek-*` 的请求到达上游时携带的是 `[Image 1/2 (image/png)] <视觉模型的描述>` 文本块，而非 `image_url` part。hook 覆盖转换器会发出的所有图片：用户消息 image 块、base64 image document 块、以及嵌在 tool_result 里的图片。非图片 document 不受影响。
+
+细节：
+
+- **默认同上游、只换模型名**：仅覆盖 model 字段。如需独立视觉上游，设置 `--image-caption-base-url` / `--image-caption-api-key`。
+- **每请求一次批量调用**：当前请求中所有未缓存的图片放进同一个消息发给视觉模型，要求其按编号逐张描述。
+- **按内容哈希缓存**（`--image-caption-cache-ttl`，默认 24h）：多轮对话、重试、`previous_response_id` 历史展开时重放同一张图片只付一次描述成本。
+- **失败只降级、不阻断**：视觉调用失败或回复无法解析时，图片回退为与 `--max-upstream-images` 相同的文本占位符，请求照常进行。
+- hook 在图片裁剪之后、转换之前执行，目前仅作用于 `/v1/messages`。
+
 ### 透传模式
 
 当 `--upstream-api-key` 与 `--auth-token` 均未配置时，自动启用透传模式：客户端通过 `x-api-key` 或 `Authorization` 头部传入的 Key 将原样转发给上游端点。
@@ -423,7 +451,7 @@ docker run -p 8082:8082 chat-to-messages \
 | `redacted_thinking` block | 重放为 `[redacted thinking]` 占位符 | 保留多轮推理链 |
 | `thinking` block（带签名） | 以 `<!--sig:...-->` 前缀保留在 thinking tag 中 | 多轮验证的往返签名保留 |
 | `document` block | 序列化为 `[Document: filename (media_type)]` 文本 | PDF/文档感知（二进制不转发） |
-| `image` block（base64/url） | `image_url` content part | Anthropic 图片块转为 OpenAI 格式 |
+| `image` block（base64/url） | `image_url` content part | Anthropic 图片块转为 OpenAI 格式；对 `--hook-image-caption` 命中的模型，在转换前已被描述文本块替换 |
 
 ### 流式 SSE 事件映射
 

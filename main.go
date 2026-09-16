@@ -34,6 +34,9 @@ func main() {
 	fmt.Printf("  OpenAI passthrough: /v1/chat/completions, /v1/models\n")
 	fmt.Printf("  OpenAI responses: /v1/responses (SSE + websocket, store TTL %d min)\n", cfg.ResponsesStoreTTLMinutes)
 	fmt.Printf("  Dump: %s\n", orDisabled(cfg.DumpDir))
+	if len(cfg.HookImageCaptionPatterns) > 0 {
+		fmt.Printf("  Image caption: %s (model %s)\n", joinAll(cfg.HookImageCaptionPatterns), cfg.ImageCaptionModel)
+	}
 	if len(cfg.ModelOverrides) > 0 {
 		fmt.Printf("  Model overrides:\n")
 		for _, e := range cfg.ModelOverrides {

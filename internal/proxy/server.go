@@ -23,6 +23,8 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/config"
 	"github.com/chinfeng/chat-to-messages/internal/convert"
 	"github.com/chinfeng/chat-to-messages/internal/dump"
+	"github.com/chinfeng/chat-to-messages/internal/hook"
+	"github.com/chinfeng/chat-to-messages/internal/hook/caption"
 	"github.com/chinfeng/chat-to-messages/internal/openai"
 	"github.com/chinfeng/chat-to-messages/internal/responses"
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
@@ -142,6 +144,7 @@ func headerMap(h http.Header) map[string]string {
 // here.
 func NewHandler(cfg *config.Config) http.Handler {
 	responsesStore := responses.NewStore(time.Duration(cfg.ResponsesStoreTTLMinutes) * time.Minute)
+	hooks := buildHookRegistry(cfg)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -151,17 +154,29 @@ func NewHandler(cfg *config.Config) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		handleRequest(w, r, cfg, responsesStore)
+		handleRequest(w, r, cfg, responsesStore, hooks)
 	})
 }
 
+// buildHookRegistry wires the request hooks: eviction first (it removes the
+// oldest images so downstream image hooks see a bounded request), then the
+// caption hook when the operator has configured non-visual model globs.
+func buildHookRegistry(cfg *config.Config) *hook.Registry {
+	r := hook.NewRegistry()
+	r.Register(&hook.EvictionHook{Keep: cfg.MaxUpstreamImages})
+	if len(cfg.HookImageCaptionPatterns) > 0 {
+		r.Register(caption.New(cfg))
+	}
+	return r
+}
+
 // handleRequest routes a request (port of routeRequest() in routes.ts).
-func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, responsesStore *responses.Store) {
+func handleRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, responsesStore *responses.Store, hooks *hook.Registry) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
-		handleMessages(w, r, cfg)
+		handleMessages(w, r, cfg, hooks)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
 		handleResponses(w, r, cfg, responsesStore)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/responses":
@@ -514,7 +529,7 @@ func midStreamRetryHook(ctx context.Context, cfg *config.Config, session *dump.S
 
 // handleMessages handles POST /v1/messages (port of handleMessages() in
 // routes.ts): auth, body validation, upstream request, and the SSE pump.
-func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, hooks *hook.Registry) {
 	session := dump.NewSession(cfg.DumpDir)
 	requestStart := time.Now()
 	requestDatetime := time.Now().UTC().Format(time.RFC3339)
@@ -578,10 +593,15 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config) 
 		return
 	}
 
-	// Evict old images to text placeholders before conversion — the upstream
-	// channel deterministically fails requests carrying too many images
-	// (z-ai: >= 8); the most recent MaxUpstreamImages survive.
-	convert.EvictOldImages(req.Messages, cfg.MaxUpstreamImages)
+	// Request hooks run after validation and before conversion: eviction
+	// caps images for the upstream channel, then the caption hook replaces
+	// images with vision-model captions for models the operator ruled
+	// non-visual. A hook error fails the request.
+	if err := hooks.Apply(r.Context(), &hook.Request{Model: req.Model, Messages: req.Messages}); err != nil {
+		session.Finish()
+		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
+		return
+	}
 
 	requestData := &convert.RequestData{
 		Model:         req.Model,
