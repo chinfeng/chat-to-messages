@@ -100,6 +100,11 @@ type Config struct {
 	// (any previous_response_id then 404s).
 	ResponsesStoreTTLMinutes int
 
+	// DumpRetentionDays is the automatic dump-cleanup age: sessions older
+	// than this are pruned at startup and hourly afterwards. It only takes
+	// effect when DumpDir is set (--dump); 0 disables pruning entirely.
+	DumpRetentionDays int
+
 	// MaxUpstreamImages caps the number of images sent to the upstream per
 	// request: older images (earliest first, document order) are replaced
 	// with text placeholders before conversion. The z-ai channel
@@ -289,6 +294,13 @@ func Load(args []string) *Config {
 		maxUpstreamImages = 7
 	}
 
+	// Dump retention: negative is a typo — fall back to the 3-day default.
+	dumpRetention := parseInt(getArg("dump-retention-days", "3"))
+	if dumpRetention < 0 {
+		warn("Invalid --dump-retention-days %d (must be >= 0); using 3", dumpRetention)
+		dumpRetention = 3
+	}
+
 	// Mid-stream stall window: negative is a typo — fall back to the default.
 	midStreamStall := parseInt(getArg("mid-stream-stall-timeout", "120"))
 	if midStreamStall < 0 {
@@ -327,6 +339,7 @@ func Load(args []string) *Config {
 		Port:                     port,
 		EnableThinking:           getBool("enable-thinking", true),
 		DumpDir:                  getArg("dump", ""),
+		DumpRetentionDays:        dumpRetention,
 		ModelOverrides:           modelOverrides,
 		ServerTools:              serverTools,
 		DefaultReasoningReplay:   defaultReplay,

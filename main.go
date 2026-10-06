@@ -9,8 +9,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/chinfeng/chat-to-messages/internal/config"
+	"github.com/chinfeng/chat-to-messages/internal/dump"
 	"github.com/chinfeng/chat-to-messages/internal/proxy"
 )
 
@@ -34,6 +36,10 @@ func main() {
 	fmt.Printf("  OpenAI passthrough: /v1/chat/completions, /v1/models\n")
 	fmt.Printf("  OpenAI responses: /v1/responses (SSE + websocket, store TTL %d min)\n", cfg.ResponsesStoreTTLMinutes)
 	fmt.Printf("  Dump: %s\n", orDisabled(cfg.DumpDir))
+	if cfg.DumpDir != "" && cfg.DumpRetentionDays > 0 {
+		fmt.Printf("  Dump retention: %d days\n", cfg.DumpRetentionDays)
+		go dump.StartJanitor(cfg.DumpDir, time.Duration(cfg.DumpRetentionDays)*24*time.Hour)
+	}
 	if len(cfg.HookImageCaptionPatterns) > 0 {
 		fmt.Printf("  Image caption: %s (model %s)\n", joinAll(cfg.HookImageCaptionPatterns), cfg.ImageCaptionModel)
 	}

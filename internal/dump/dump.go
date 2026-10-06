@@ -238,6 +238,78 @@ func pickTerminationReason(tracked TerminationReason, upstream *Termination) Ter
 	return tracked
 }
 
+// StartJanitor prunes dump sessions older than maxAge from dir: once at
+// startup, then hourly for the process lifetime. It is only meaningful for a
+// configured --dump directory; a non-positive maxAge (or empty dir) is a
+// no-op.
+func StartJanitor(dir string, maxAge time.Duration) {
+	if dir == "" || maxAge <= 0 {
+		return
+	}
+	Prune(dir, time.Now().Add(-maxAge))
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for range t.C {
+		Prune(dir, time.Now().Add(-maxAge))
+	}
+}
+
+// Prune removes every dump session under dir whose start time is before
+// cutoff. Session age is the Unix-ms timestamp encoded in the leading UUID v7
+// of the session directory name (in-progress dirs are named by the id alone,
+// finished dirs "<id>__START_..."); undatable names (stray files/dirs from
+// older versions) fall back to their modtime, and what cannot be dated at all
+// is kept rather than risk a live session.
+func Prune(dir string, cutoff time.Time) {
+	buckets, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, b := range buckets {
+		if !b.IsDir() {
+			continue // bucket directories only
+		}
+		sessions, err := os.ReadDir(filepath.Join(dir, b.Name()))
+		if err != nil {
+			continue
+		}
+		for _, s := range sessions {
+			if sessionStart(s).Before(cutoff) {
+				_ = os.RemoveAll(filepath.Join(dir, b.Name(), s.Name()))
+			}
+		}
+	}
+}
+
+func sessionStart(e os.DirEntry) time.Time {
+	name := e.Name()
+	if i := strings.Index(name, "__"); i != -1 {
+		name = name[:i] // finished dirs: <id>__START_... → id
+	}
+	if t, ok := parseIDTime(name); ok {
+		return t
+	}
+	info, err := e.Info()
+	if err != nil {
+		return time.Now() // undatable → never before any cutoff → kept
+	}
+	return info.ModTime()
+}
+
+// parseIDTime extracts the request-start timestamp of a UUID v7 session id:
+// its leading 48 bits are Unix ms, which is also why ids sort into
+// request-start order.
+func parseIDTime(id string) (time.Time, bool) {
+	if len(id) != 36 || id[8] != '-' || id[14] != '7' {
+		return time.Time{}, false
+	}
+	ms, err := strconv.ParseInt(id[:8]+id[9:13], 16, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
+}
+
 func getTargetSubdir(reason TerminationReason) string {
 	switch reason {
 	case Completed:

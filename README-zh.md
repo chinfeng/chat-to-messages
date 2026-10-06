@@ -148,6 +148,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--reasoning-replay` | `think_tags` | 助手 thinking 块回放给上游的方式：`think_tags`、`reasoning_content` 或 `disabled`。接受裸模式（全局默认）或 `glob=mode` 按模型规则（可重复指定，首个匹配生效）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
+| `--dump-retention-days` | `3` | 自动清理转储目录中 n 天前的会话（启动时清扫一次，之后每小时一次）；仅在指定了 `--dump` 时生效，`0` 禁用清理 |
 | `--enable-web-search` | `false` | 启用代理端 Web 搜索 |
 | `--web-search-engine` | `brave` | 搜索引擎类型：`brave`（Brave Search API）或 `searxng`（SearXNG） |
 | `--enable-web-fetch` | `false` | 启用代理端 Web 抓取（HTTP GET + 域名过滤） |
@@ -345,6 +346,8 @@ SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
 最终目录名为 `<id>__START_<开始时间>__END_<结束时间>`。`<id>` 为 UUID v7，其前 48 位编码了请求发起的 Unix 毫秒时间戳，因此按目录名字典序排序即可得到各桶内的请求时序（`__START_`/`__END_` 后缀仅便于人眼阅读）。客户端主动断开优先于一切；其次以上游自身的终止记录为准；最后才是下游侧记录的结果。
 
 每个会话包含 `downstream-request.log`、`downstream-response.log`、`upstream-request.log` 和 `upstream-response.log` — 流式响应体即为完整 SSE 事件流。若调用了代理端 server tools（web_search / web_fetch / agentic loop），还会额外写入按调用逐条记录的 `server-tools.log`。
+
+配合 `--dump-retention-days N`（默认 `3`）可自动清理 N 天前的会话：进程启动时清扫一次，之后每小时清扫一次；`0` 禁用自动清理。会话年龄取自目录名中 UUID v7 编码的请求开始时间，因此不受文件时间戳影响。
 
 ```bash
 ./chat-to-messages \

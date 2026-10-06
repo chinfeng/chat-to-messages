@@ -148,6 +148,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--reasoning-replay` | `think_tags` | How assistant thinking blocks are replayed upstream: `think_tags`, `reasoning_content`, or `disabled`. Accepts a bare mode (global default) or `glob=mode` per-model rules (repeatable, first match wins); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
+| `--dump-retention-days` | `3` | Prune dump sessions older than this many days (once at startup, then hourly); only effective when `--dump` is set, `0` disables pruning |
 | `--enable-web-search` | `false` | Enable proxy-side web search |
 | `--web-search-engine` | `brave` | Search engine type: `brave` (Brave Search API) or `searxng` (SearXNG) |
 | `--enable-web-fetch` | `false` | Enable proxy-side web fetch (HTTP GET with domain filtering) |
@@ -345,6 +346,8 @@ Enable `--dump <dir>` to record each downstream request. A session is written to
 The final directory name is `<id>__START_<startTime>__END_<endTime>`. The id is a UUID v7 whose leading 48 bits encode the request-start Unix timestamp in milliseconds, so sorting directory names lexicographically already yields the chronological request order within each bucket (the `__START_`/`__END_` suffix remains for human readability). A client-initiated disconnect takes precedence over everything; otherwise the upstream's own recorded outcome wins over the downstream outcome.
 
 Each session contains `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log` — the streaming bodies capture the full SSE event streams. When proxy-side server tools (web_search / web_fetch / agentic loop) were invoked, a `server-tools.log` with one entry per call is written as well.
+
+Pair with `--dump-retention-days N` (default `3`) to prune sessions older than N days — once at startup, then hourly; `0` disables the sweep. Session age comes from the UUID v7 request-start timestamp encoded in the directory name, so it is independent of filesystem timestamps.
 
 ```bash
 ./chat-to-messages \

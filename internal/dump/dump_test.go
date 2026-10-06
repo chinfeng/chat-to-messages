@@ -1,6 +1,7 @@
 package dump
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -164,5 +165,70 @@ func TestServerToolLog(t *testing.T) {
 	// "[Result Count]\n<数字>\n\n"，非 "Result Count: 10" 行式格式。
 	if !strings.Contains(string(b), "[Tool]") || !strings.Contains(string(b), "[Result Count]\n10") {
 		t.Errorf("server-tools.log: %s", b)
+	}
+}
+
+// idAt 构造一个 UUID v7 会话 id，其前 48 位为 ts 的 Unix 毫秒，使 Prune 能按
+// 请求开始时间判定会话年龄（而非依赖 mtime）。
+func idAt(ts time.Time) string {
+	h := fmt.Sprintf("%012x", ts.UnixMilli())
+	return fmt.Sprintf("%s-%s-7111-8111-111111111111", h[:8], h[8:12])
+}
+
+func TestPruneRemovesOldKeepsFresh(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().AddDate(0, 0, -10)
+	fresh := time.Now()
+	buckets := []string{"completed", "client-aborted", "upstream-aborted", "failed", "in-progress"}
+	for _, bucket := range buckets {
+		for _, ts := range []time.Time{old, fresh} {
+			name := idAt(ts)
+			if bucket != "in-progress" {
+				name += "__START_x__END_x"
+			}
+			s := filepath.Join(dir, bucket, name)
+			if err := os.MkdirAll(s, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(s, "downstream-request.log"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	Prune(dir, time.Now().AddDate(0, 0, -3))
+
+	for _, bucket := range buckets {
+		entries, err := os.ReadDir(filepath.Join(dir, bucket))
+		if err != nil {
+			t.Fatalf("%s: %v", bucket, err)
+		}
+		if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), idAt(fresh)[:8]) {
+			t.Errorf("%s after prune = %v, want only the fresh session", bucket, entries)
+		}
+	}
+}
+
+func TestPruneUndatableNameFallsBackToModTime(t *testing.T) {
+	dir := t.TempDir()
+	oldDir := filepath.Join(dir, "completed", "manual-session")
+	newDir := filepath.Join(dir, "completed", "manual-session-2")
+	for _, s := range []string{oldDir, newDir} {
+		if err := os.MkdirAll(s, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().AddDate(0, 0, -10)
+	if err := os.Chtimes(oldDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	Prune(dir, time.Now().AddDate(0, 0, -3))
+
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Errorf("old undatable session not pruned: %v", err)
+	}
+	if _, err := os.Stat(newDir); err != nil {
+		t.Errorf("recent undatable session pruned: %v", err)
 	}
 }

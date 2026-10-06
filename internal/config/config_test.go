@@ -365,6 +365,30 @@ func TestLoadGuardDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadDumpRetentionDefault(t *testing.T) {
+	cfg := Load(nil)
+	if cfg.DumpRetentionDays != 3 {
+		t.Errorf("DumpRetentionDays = %d, want 3", cfg.DumpRetentionDays)
+	}
+}
+
+func TestLoadDumpRetentionFlag(t *testing.T) {
+	cfg := Load([]string{"--dump-retention-days", "7"})
+	if cfg.DumpRetentionDays != 7 {
+		t.Errorf("DumpRetentionDays = %d, want 7", cfg.DumpRetentionDays)
+	}
+	// 负数是笔误 — 回落 3 天默认值。
+	cfg = Load([]string{"--dump-retention-days=-1"})
+	if cfg.DumpRetentionDays != 3 {
+		t.Errorf("negative retention = %d, want fallback 3", cfg.DumpRetentionDays)
+	}
+	// 0 显式禁用清理。
+	cfg = Load([]string{"--dump-retention-days", "0"})
+	if cfg.DumpRetentionDays != 0 {
+		t.Errorf("zero retention = %d, want 0", cfg.DumpRetentionDays)
+	}
+}
+
 func TestLoadGuardFlags(t *testing.T) {
 	cfg := Load([]string{
 		"--no-sanitize-client-meta-turns",
