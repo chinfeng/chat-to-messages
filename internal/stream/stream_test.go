@@ -1171,6 +1171,52 @@ func TestStreamUsageEstimateFallback(t *testing.T) {
 	}
 }
 
+func TestStreamOnCompletedUsageFiresOnGracefulCompletion(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":7}}\n\n"
+	chunks := chunksFromSSE(t, body)
+	var got int64 = -1
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil,
+		&Options{OnCompletedUsage: func(promptTokens int64) { got = promptTokens }})
+	if _, err := collect(t, st); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1234 {
+		t.Errorf("OnCompletedUsage promptTokens = %d, want 1234", got)
+	}
+}
+
+func TestStreamOnCompletedUsageSilentWithoutUsageChunk(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	chunks := chunksFromSSE(t, body)
+	called := false
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil,
+		&Options{OnCompletedUsage: func(promptTokens int64) { called = true }})
+	if _, err := collect(t, st); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Error("OnCompletedUsage fired without a usage chunk")
+	}
+}
+
+func TestStreamOnCompletedUsageNotFiredOnAbort(t *testing.T) {
+	chunks := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{Content: strPtr("partial")}}}},
+		{Err: errors.New("connection reset by peer")},
+	}
+	called := false
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), req(t, "m1"), 10, true, nil,
+		&Options{OnCompletedUsage: func(promptTokens int64) { called = true }})
+	if _, err := collect(t, st); err == nil {
+		t.Fatal("expected abort error")
+	}
+	if called {
+		t.Error("OnCompletedUsage fired on an aborted turn")
+	}
+}
+
 func strPtr(s string) *string { return &s }
 func int64Ptr(i int64) *int64 { return &i }
 

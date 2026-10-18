@@ -30,6 +30,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
 	"github.com/chinfeng/chat-to-messages/internal/sse"
 	"github.com/chinfeng/chat-to-messages/internal/stream"
+	"github.com/chinfeng/chat-to-messages/internal/usage"
 	"github.com/chinfeng/chat-to-messages/internal/ws"
 )
 
@@ -624,13 +625,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 
 		SanitizeClientMetaTurns: cfg.SanitizeClientMetaTurns,
 	}
-	inputTokens := convert.EstimateInputTokens(req.Messages)
+	// Raw char/4 estimate, then scaled by the in-memory per-model tokenizer
+	// ratio learned from completed turns (resets to 1.0 on restart): upstream
+	// tokenizers run denser than char/4 (measured 1.54× on GLM), which made
+	// message_start disagree with message_delta by that same factor.
+	rawEstimate := convert.EstimateInputTokens(req.Messages)
+	inputTokens := usage.Default.Scaled(req.Model, rawEstimate)
 
 	// --- Server tool agentic loop: requests containing server tool types are
 	// intercepted and handled by the agentic loop in agentic.go (web_search /
 	// web_fetch executed proxy-side, results injected, final text streamed). ---
 	if (cfg.ServerTools.WebSearch || cfg.ServerTools.WebFetch) && hasServerToolRequest(&req) {
-		handleServerToolRequest(w, r, cfg, session, requestStart, requestData, apiKey, inputTokens)
+		handleServerToolRequest(w, r, cfg, session, requestStart, requestData, apiKey, rawEstimate)
 		return
 	}
 
@@ -686,6 +692,13 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
 			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
 			MidStreamRetry:      midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey),
+			// Ratio update point for successful turns: finalize fires only on
+			// graceful completion, usageInfo only exists when the upstream sent
+			// the usage chunk. Covers streaming AND non-streaming clients —
+			// both consume this same streamer.
+			OnCompletedUsage: func(promptTokens int64) {
+				usage.Default.Observe(req.Model, rawEstimate, promptTokens)
+			},
 		})
 
 	// Non-streaming client (stream omitted or false — the Anthropic default):

@@ -87,6 +87,13 @@ type Options struct {
 	// reference streams one response verbatim; this guards the newapi/GLM
 	// relay killing long plan generations mid-stream (dumped 2026-09-13).
 	MidStreamRetry func(attempt int, err error) iter.Seq[openai.Chunk]
+	// OnCompletedUsage, when non-nil, is invoked once from finalize with the
+	// upstream's real prompt_tokens — the usage chunk arrives only at stream
+	// END, so aborted turns never reach it and this fires on graceful
+	// completion only. Feeds the in-memory per-model tokenizer-ratio tracker
+	// (internal/usage). GO-ONLY EXTENSION: the TS reference streams one
+	// response verbatim.
+	OnCompletedUsage func(promptTokens int64)
 }
 
 // InvisibleTurnInfo snapshots an abandoned invisible turn for the
@@ -560,6 +567,13 @@ func (s *Streamer) emptyTurnGuard(emit func(string), stop *bool) {
 // parser flushes, orphaned tool resolution, empty-turn guard, empty-content
 // placeholder, task-args flush, block close, and the terminal message events.
 func (s *Streamer) finalize(emit func(string), stop *bool) {
+	// Ratio observation point: only graceful completions reach finalize
+	// (aborted turns exit via handleError), and the upstream usage chunk
+	// arrives only at stream end — so this is exactly "one successful turn".
+	if s.opts != nil && s.opts.OnCompletedUsage != nil && s.usageInfo != nil && s.usageInfo.PromptTokens > 0 {
+		s.opts.OnCompletedUsage(s.usageInfo.PromptTokens)
+	}
+
 	if remaining := s.thinkParser.Flush(); remaining != nil {
 		if remaining.Type == parsers.ThinkingContent {
 			if s.thinkingEnabled {

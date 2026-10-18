@@ -33,6 +33,7 @@ import (
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
 	"github.com/chinfeng/chat-to-messages/internal/sse"
 	"github.com/chinfeng/chat-to-messages/internal/stream"
+	"github.com/chinfeng/chat-to-messages/internal/usage"
 )
 
 // maxIterations bounds the agentic loop (MAX_ITERATIONS in routes.ts).
@@ -300,8 +301,15 @@ func handleAgenticLoopErrorStatus(w http.ResponseWriter, session *dump.Session, 
 
 // handleServerToolRequest runs the agentic loop for requests that contain
 // server tools (port of handleServerToolRequest() in routes.ts).
-func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, apiKey string, inputTokens int64) {
+// rawEstimate is the unscaled char/4 input estimate, kept for the tokenizer-
+// ratio observation on completion.
+func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, requestData *convert.RequestData, apiKey string, rawEstimate int64) {
 	onLog := session.LogServerTool
+
+	// Scale the char/4 estimate by the learned tokenizer ratio, same as the
+	// standard flow in server.go; rawEstimate is kept unscaled for the
+	// completion-time ratio observation below.
+	inputTokens := usage.Default.Scaled(requestData.Model, rawEstimate)
 
 	// Build the initial upstream request body (the full body — Claude Code
 	// puts server tools in the tools array, so the schemas ride along).
@@ -800,6 +808,9 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 	//    sent no usage chunk.
 	if finalUsage != nil {
 		builder.SetUsage(*finalUsage)
+		// Ratio observation point: the agentic loop reaches here only on
+		// graceful completion (mid-stream failure returns at inner.Err()).
+		usage.Default.Observe(requestData.Model, rawEstimate, finalUsage.PromptTokens)
 	}
 	completion := builder.EstimateOutputTokens()
 	if finalUsage != nil {

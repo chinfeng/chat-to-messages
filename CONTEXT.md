@@ -26,3 +26,7 @@ _Avoid_: (do not call request hooks just "hooks")
 
 **Image-caption hook**:
 The first non-trivial request hook: for models the operator rules non-visual, replace each image block with a text block holding a caption produced by a vision model, so a text-only upstream model still receives image content.
+
+**Tokenizer ratio**:
+The in-memory per-model ratio (internal/usage) between the upstream's real prompt_tokens and the proxy's char/4 estimate, learned from successfully completed turns and applied to scale the message_start input estimate. Resets to 1.0 on restart; never persisted.
+_Avoid_: calibration, conversion factor
