@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chinfeng/chat-to-messages/internal/anthropic"
+	"github.com/chinfeng/chat-to-messages/internal/parsers"
 	"github.com/chinfeng/chat-to-messages/internal/servertool"
 )
 
@@ -1004,6 +1005,46 @@ type RequestData struct {
 	// Go-only user meta-turn normalization (proxy config
 	// --sanitize-client-meta-turns). See SanitizeUserMetaTurn.
 	SanitizeClientMetaTurns bool
+
+	// UpstreamBugDefenses gates defenses against known upstream defects
+	// (proxy config --upstream-bug-defenses). When true, DSML residue leaked by
+	// the upstream into assistant replay history is stripped before conversion.
+	// Zero value false means "leave history untouched", matching pre-flag
+	// behavior for callers that do not set it.
+	UpstreamBugDefenses bool
+}
+
+// StripDSMLResidueFromMessages returns a copy of messages with leaked DSML
+// marker residue removed from assistant text and thinking blocks. User and
+// tool content is never modified, and the input slice is left intact so the
+// raw downstream request can still be dumped verbatim.
+func StripDSMLResidueFromMessages(messages []anthropic.Message) []anthropic.Message {
+	out := make([]anthropic.Message, len(messages))
+	copy(out, messages)
+	for i := range out {
+		if out[i].Role != "assistant" {
+			continue
+		}
+		if out[i].Content.IsString {
+			out[i].Content.Str = parsers.StripDSMLResidue(out[i].Content.Str)
+			continue
+		}
+		if len(out[i].Content.BlocksVal) == 0 {
+			continue
+		}
+		blocks := make([]anthropic.ContentBlock, len(out[i].Content.BlocksVal))
+		copy(blocks, out[i].Content.BlocksVal)
+		for j := range blocks {
+			switch blocks[j].Type {
+			case "text":
+				blocks[j].Text = parsers.StripDSMLResidue(blocks[j].Text)
+			case "thinking":
+				blocks[j].Thinking = parsers.StripDSMLResidue(blocks[j].Thinking)
+			}
+		}
+		out[i].Content.BlocksVal = blocks
+	}
+	return out
 }
 
 // BuildBaseRequestBody mirrors buildBaseRequestBody() in converter.ts.
@@ -1012,7 +1053,11 @@ type RequestData struct {
 // (type, name), and re-exposed as OpenAI function schemas plus a system
 // prompt suffix.
 func BuildBaseRequestBody(req *RequestData, defaultMaxTokens any, reasoningReplay ReasoningReplayMode) (map[string]any, error) {
-	messages, err := ConvertMessages(req.Messages, reasoningReplay, req.SanitizeClientMetaTurns)
+	messagesIn := req.Messages
+	if req.UpstreamBugDefenses {
+		messagesIn = StripDSMLResidueFromMessages(messagesIn)
+	}
+	messages, err := ConvertMessages(messagesIn, reasoningReplay, req.SanitizeClientMetaTurns)
 	if err != nil {
 		return nil, err
 	}

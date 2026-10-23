@@ -54,11 +54,22 @@ type HeuristicToolParser struct {
 	currentToolID       string
 	currentFunctionName string
 	currentParameters   map[string]string
+	// stripControlTokens strips provider control tokens like
+	// <|begin_of_text|>. It is an upstream-bug defense and is switched off
+	// together with the master --upstream-bug-defenses flag.
+	stripControlTokens bool
 }
 
 // NewHeuristicToolParser creates a HeuristicToolParser in TEXT state.
 func NewHeuristicToolParser() *HeuristicToolParser {
-	return &HeuristicToolParser{state: parserStateText}
+	return &HeuristicToolParser{state: parserStateText, stripControlTokens: true}
+}
+
+// SetControlTokenStripping enables or disables provider control-token removal
+// (enabled by default). Disabling it leaves the upstream text byte-for-byte
+// intact, for a clean passthrough baseline.
+func (p *HeuristicToolParser) SetControlTokenStripping(enabled bool) {
+	p.stripControlTokens = enabled
 }
 
 // heuristicToolID returns a tool_use id of the form
@@ -123,6 +134,9 @@ func decodeJSONObject(s string) (map[string]any, bool) {
 // "<|" control-token start at the end of the buffer, leaving the
 // incomplete token in the buffer for the next feed.
 func (p *HeuristicToolParser) splitIncompleteControlTokenTail() string {
+	if !p.stripControlTokens {
+		return ""
+	}
 	start := strings.LastIndex(p.buffer, controlTokenStart)
 	if start == -1 {
 		return ""
@@ -139,7 +153,9 @@ func (p *HeuristicToolParser) splitIncompleteControlTokenTail() string {
 // that is complete so far plus any fully detected tool calls.
 func (p *HeuristicToolParser) Feed(text string) (string, []map[string]any) {
 	p.buffer += text
-	p.buffer = controlTokenRE.ReplaceAllString(p.buffer, "")
+	if p.stripControlTokens {
+		p.buffer = controlTokenRE.ReplaceAllString(p.buffer, "")
+	}
 
 	filteredBuffer, detectedTools := p.extractWebToolJSONCalls()
 	p.buffer = filteredBuffer
@@ -249,7 +265,9 @@ func (p *HeuristicToolParser) buildTool() map[string]any {
 // still being parsed is emitted (collecting any unterminated trailing
 // parameter), and remaining buffer text is returned.
 func (p *HeuristicToolParser) Flush() (string, []map[string]any) {
-	p.buffer = controlTokenRE.ReplaceAllString(p.buffer, "")
+	if p.stripControlTokens {
+		p.buffer = controlTokenRE.ReplaceAllString(p.buffer, "")
+	}
 	var detectedTools []map[string]any
 	var remainingText string
 

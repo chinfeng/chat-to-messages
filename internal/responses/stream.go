@@ -38,6 +38,11 @@ type Translator struct {
 
 	thinkParser    *parsers.ThinkTagParser
 	heuristicParse *parsers.HeuristicToolParser
+	// defend is the resolved master switch: true unless the caller disabled
+	// upstream-bug defenses.
+	defend        bool
+	contentDSML   *parsers.DSMLFilter
+	reasoningDSML *parsers.DSMLFilter
 
 	usage        *openai.Usage
 	finishReason string
@@ -59,16 +64,35 @@ type toolState struct {
 // response.failed downstream).
 type StreamFailure struct{ Code, Message string }
 
+// TranslatorOptions carries optional translator behavior switches.
+type TranslatorOptions struct {
+	// DisableUpstreamBugDefenses turns OFF the master defense switch
+	// (config --no-upstream-bug-defenses): DSML residue in text/reasoning
+	// passes through, provider control tokens are preserved, and the upstream
+	// tool-call id is used as call_id instead of a proxy-minted one. Zero
+	// value false keeps every defense ON.
+	DisableUpstreamBugDefenses bool
+}
+
 // NewTranslator creates a translator for one request. responseID is the
 // downstream-facing resp_ id; base echoes the request's response fields.
 func NewTranslator(req *Request, responseID string) *Translator {
+	return NewTranslatorWithOptions(req, responseID, TranslatorOptions{})
+}
+
+// NewTranslatorWithOptions creates a translator with explicit options.
+func NewTranslatorWithOptions(req *Request, responseID string, opts TranslatorOptions) *Translator {
 	t := &Translator{
 		responseID:     responseID,
 		wantEncrypted:  req.WantsEncrypted(),
 		tools:          make(map[int]*toolState),
 		thinkParser:    parsers.NewThinkTagParser(),
 		heuristicParse: parsers.NewHeuristicToolParser(),
+		defend:         !opts.DisableUpstreamBugDefenses,
+		contentDSML:    parsers.NewDSMLFilter(),
+		reasoningDSML:  parsers.NewDSMLFilter(),
 	}
+	t.heuristicParse.SetControlTokenStripping(t.defend)
 	t.base = baseResponse(req, responseID)
 	return t
 }
@@ -147,7 +171,7 @@ func (t *Translator) Process(c openai.Chunk) []string {
 
 	// Native tool calls.
 	for _, tc := range delta.ToolCalls {
-		st := t.tool(tc.Index)
+		st := t.tool(tc.Index, tc.ID)
 		if tc.Function.Name != nil && *tc.Function.Name != "" {
 			st.name = *tc.Function.Name
 		}
@@ -192,12 +216,22 @@ func (t *Translator) Finish() []string {
 			t.emitTextDelta(emit, remaining.Content)
 		}
 	}
+	if t.defend {
+		if rest := t.reasoningDSML.Flush(); rest != "" {
+			t.emitReasoningRaw(emit, rest)
+		}
+	}
 	if filtered, toolUses := t.heuristicParse.Flush(); filtered != "" || len(toolUses) > 0 {
 		if filtered != "" {
 			t.emitTextDelta(emit, filtered)
 		}
 		for _, toolUse := range toolUses {
 			t.emitHeuristicToolCall(emit, toolUse)
+		}
+	}
+	if t.defend {
+		if rest := t.contentDSML.Flush(); rest != "" {
+			t.emitTextRaw(emit, rest)
 		}
 	}
 
@@ -267,11 +301,23 @@ func (t *Translator) ensureStarted(emit func(string, map[string]any)) {
 	emit("response.in_progress", map[string]any{"type": "response.in_progress", "response": resp})
 }
 
-// emitReasoningDelta opens the reasoning item (one summary part) on first
+// emitReasoningDelta routes reasoning text through the DSML filter when
+// defenses are on and streams whatever is safe.
+func (t *Translator) emitReasoningDelta(emit func(string, map[string]any), text string) {
+	if t.defend {
+		text = t.reasoningDSML.Feed(text)
+	}
+	if text == "" {
+		return
+	}
+	t.emitReasoningRaw(emit, text)
+}
+
+// emitReasoningRaw opens the reasoning item (one summary part) on first
 // reason chunk and streams the delta. Like every output item, opening it
 // first closes whatever item is currently streaming (items never interleave;
 // output_index counts closed items).
-func (t *Translator) emitReasoningDelta(emit func(string, map[string]any), text string) {
+func (t *Translator) emitReasoningRaw(emit func(string, map[string]any), text string) {
 	if !t.reasoningOpen {
 		if t.openTool != nil {
 			t.closeToolItem(emit, t.openTool)
@@ -353,9 +399,21 @@ func reasoningItem(id, summary string, wantEncrypted bool) map[string]any {
 	return item
 }
 
-// emitTextDelta opens the message item (with its lone output_text part) on
-// first text and streams the delta.
+// emitTextDelta routes visible text through the DSML filter when defenses are
+// on and streams whatever is safe.
 func (t *Translator) emitTextDelta(emit func(string, map[string]any), text string) {
+	if t.defend {
+		text = t.contentDSML.Feed(text)
+	}
+	if text == "" {
+		return
+	}
+	t.emitTextRaw(emit, text)
+}
+
+// emitTextRaw opens the message item (with its lone output_text part) on
+// first text and streams the delta.
+func (t *Translator) emitTextRaw(emit func(string, map[string]any), text string) {
 	// A message item cannot coexist with an open reasoning/tool item: close
 	// whatever is streaming (mirrors the Anthropic side's block switch).
 	if t.openTool != nil {
@@ -431,12 +489,21 @@ func (t *Translator) closeMessage(emit func(string, map[string]any)) {
 	})
 }
 
-// tool returns (creating) the state for upstream tool-call index.
-func (t *Translator) tool(index int) *toolState {
+// tool returns (creating) the state for upstream tool-call index. upstreamID
+// is adopted as call_id only when the master defense switch is off; otherwise
+// a proxy id is minted at creation.
+func (t *Translator) tool(index int, upstreamID *string) *toolState {
 	if st, ok := t.tools[index]; ok {
+		if !t.defend && !st.opened && upstreamID != nil && *upstreamID != "" {
+			st.callID = *upstreamID
+		}
 		return st
 	}
-	st := &toolState{callID: newID("call_")}
+	callID := newID("call_")
+	if !t.defend && upstreamID != nil && *upstreamID != "" {
+		callID = *upstreamID
+	}
+	st := &toolState{callID: callID}
 	t.tools[index] = st
 	t.toolOrder = append(t.toolOrder, index)
 	return st

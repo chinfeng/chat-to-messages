@@ -94,6 +94,13 @@ type Options struct {
 	// (internal/usage). GO-ONLY EXTENSION: the TS reference streams one
 	// response verbatim.
 	OnCompletedUsage func(promptTokens int64)
+	// DisableUpstreamBugDefenses turns OFF the master defense switch
+	// (config --no-upstream-bug-defenses) for this stream: DSML residue in
+	// text/reasoning passes through, provider control tokens are preserved,
+	// truncated tool-argument JSON is emitted raw, and upstream tool_use ids
+	// are not regenerated. Zero value false keeps every defense ON, preserving
+	// existing behavior for callers that do not set it.
+	DisableUpstreamBugDefenses bool
 }
 
 // InvisibleTurnInfo snapshots an abandoned invisible turn for the
@@ -173,11 +180,16 @@ type Streamer struct {
 	builder         *sse.Builder
 	thinkParser     *parsers.ThinkTagParser
 	heuristicParser *parsers.HeuristicToolParser
-	toolArgAccum    map[int]string
-	finishReason    string
-	seenDone        bool
-	usageInfo       *openai.Usage // latest raw usage chunk
-	err             error
+	// defend is the resolved master switch: true unless the caller set
+	// Options.DisableUpstreamBugDefenses.
+	defend        bool
+	contentDSML   *parsers.DSMLFilter
+	reasoningDSML *parsers.DSMLFilter
+	toolArgAccum  map[int]string
+	finishReason  string
+	seenDone      bool
+	usageInfo     *openai.Usage // latest raw usage chunk
+	err           error
 }
 
 // NewStreamer creates a Streamer. thinkingEnabledHint is the isThinkingEnabled
@@ -192,6 +204,77 @@ func NewStreamer(ctx context.Context, chunks iter.Seq[openai.Chunk], request *co
 		thinkingEnabled: thinkingEnabledHint,
 		dump:            session,
 		opts:            opts,
+		defend:          opts == nil || !opts.DisableUpstreamBugDefenses,
+	}
+}
+
+// resetParsers (re)creates the streaming text parsers and DSML filters.
+// midStreamAbortGuard calls it to drop buffers that never reached the client.
+func (s *Streamer) resetParsers() {
+	s.thinkParser = parsers.NewThinkTagParser()
+	s.heuristicParser = parsers.NewHeuristicToolParser()
+	s.heuristicParser.SetControlTokenStripping(s.defend)
+	s.contentDSML = parsers.NewDSMLFilter()
+	s.reasoningDSML = parsers.NewDSMLFilter()
+}
+
+// emitVisibleText routes visible text through the DSML rescue filter when
+// defenses are on, then emits whatever is safe as a text delta.
+func (s *Streamer) emitVisibleText(emit func(string), text string) {
+	if text == "" {
+		return
+	}
+	if s.defend {
+		text = s.contentDSML.Feed(text)
+	}
+	if text == "" {
+		return
+	}
+	s.ensureTextBlock(emit)
+	emit(s.builder.TextDelta(text))
+}
+
+// emitReasoningDelta routes reasoning text through the DSML rescue filter when
+// defenses are on, then emits whatever is safe as a thinking delta.
+func (s *Streamer) emitReasoningDelta(emit func(string), text string) {
+	if text == "" || !s.thinkingEnabled {
+		return
+	}
+	if s.defend {
+		text = s.reasoningDSML.Feed(text)
+	}
+	if text == "" {
+		return
+	}
+	for _, ev := range s.builder.EnsureThinkingBlock() {
+		emit(ev)
+	}
+	emit(s.builder.EmitThinkingDelta(text))
+}
+
+// flushReasoningDSML emits reasoning text held back by the DSML filter.
+// Unfinished marker tails are dropped by Flush; ordinary trailing text is
+// emitted.
+func (s *Streamer) flushReasoningDSML(emit func(string)) {
+	if !s.defend {
+		return
+	}
+	if rest := s.reasoningDSML.Flush(); rest != "" {
+		for _, ev := range s.builder.EnsureThinkingBlock() {
+			emit(ev)
+		}
+		emit(s.builder.EmitThinkingDelta(rest))
+	}
+}
+
+// flushContentDSML emits visible text held back by the DSML filter.
+func (s *Streamer) flushContentDSML(emit func(string)) {
+	if !s.defend {
+		return
+	}
+	if rest := s.contentDSML.Flush(); rest != "" {
+		s.ensureTextBlock(emit)
+		emit(s.builder.TextDelta(rest))
 	}
 }
 
@@ -215,8 +298,7 @@ func (s *Streamer) run(yield func(string) bool) {
 	if s.opts != nil && s.opts.StartingBlockIndex != 0 {
 		s.builder.SetNextIndex(s.opts.StartingBlockIndex)
 	}
-	s.thinkParser = parsers.NewThinkTagParser()
-	s.heuristicParser = parsers.NewHeuristicToolParser()
+	s.resetParsers()
 	s.toolArgAccum = make(map[int]string)
 
 	stop := false
@@ -279,12 +361,12 @@ func (s *Streamer) midStreamAbortGuard(emit func(string), stop *bool, loopErr er
 		// doomed attempt that must stay dropped (re-creating is safe —
 		// anything the parsers would still emit was never emitted downstream,
 		// and a fully detected tool call would have set HasEmittedToolBlock
-		// above, disabling the retry).
+		// above, disabling the retry). The DSML filters are reset too: a held
+		// partial marker from the doomed attempt is dropped, never flushed.
 		for _, ev := range s.builder.CloseContentBlocks() {
 			emit(ev)
 		}
-		s.thinkParser = parsers.NewThinkTagParser()
-		s.heuristicParser = parsers.NewHeuristicToolParser()
+		s.resetParsers()
 		s.chunks = seq
 		loopErr = s.iterate(emit, stop)
 	}
@@ -349,17 +431,13 @@ func (s *Streamer) processChunk(emit func(string), chunk openai.Chunk) (done boo
 
 	// Handle reasoning_content (thinking).
 	if s.thinkingEnabled && delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
-		for _, ev := range s.builder.EnsureThinkingBlock() {
-			emit(ev)
-		}
-		emit(s.builder.EmitThinkingDelta(*delta.ReasoningContent))
+		s.emitReasoningDelta(emit, *delta.ReasoningContent)
 	}
 
 	// Handle refusal delta — forwarded as text content so the client
 	// sees it (refusal supersedes other delta fields in this chunk).
 	if delta.Refusal != nil && *delta.Refusal != "" {
-		s.ensureTextBlock(emit)
-		emit(s.builder.TextDelta(*delta.Refusal))
+		s.emitVisibleText(emit, *delta.Refusal)
 		return false, nil
 	}
 
@@ -367,19 +445,10 @@ func (s *Streamer) processChunk(emit func(string), chunk openai.Chunk) (done boo
 	if delta.Content != nil && *delta.Content != "" {
 		for _, part := range s.thinkParser.Feed(*delta.Content) {
 			if part.Type == parsers.ThinkingContent {
-				if !s.thinkingEnabled {
-					continue
-				}
-				for _, ev := range s.builder.EnsureThinkingBlock() {
-					emit(ev)
-				}
-				emit(s.builder.EmitThinkingDelta(part.Content))
+				s.emitReasoningDelta(emit, part.Content)
 			} else {
 				filteredText, detectedTools := s.heuristicParser.Feed(part.Content)
-				if filteredText != "" {
-					s.ensureTextBlock(emit)
-					emit(s.builder.TextDelta(filteredText))
-				}
+				s.emitVisibleText(emit, filteredText)
 				for _, toolUse := range detectedTools {
 					s.iterHeuristicToolUseSse(emit, toolUse)
 				}
@@ -390,10 +459,7 @@ func (s *Streamer) processChunk(emit func(string), chunk openai.Chunk) (done boo
 	// Handle native tool calls (accumulate args for JSON repair later).
 	if len(delta.ToolCalls) > 0 {
 		heuristicText, heuristicTools := s.heuristicParser.Flush()
-		if heuristicText != "" {
-			s.ensureTextBlock(emit)
-			emit(s.builder.TextDelta(heuristicText))
-		}
+		s.emitVisibleText(emit, heuristicText)
 		for _, toolUse := range heuristicTools {
 			s.iterHeuristicToolUseSse(emit, toolUse)
 		}
@@ -457,23 +523,16 @@ func (s *Streamer) handleError(emit func(string), loopErr error) {
 	// Flush any buffered parser content BEFORE checking hadContent.
 	if remaining := s.thinkParser.Flush(); remaining != nil {
 		if remaining.Type == parsers.ThinkingContent {
-			if s.thinkingEnabled {
-				for _, ev := range s.builder.EnsureThinkingBlock() {
-					emit(ev)
-				}
-				emit(s.builder.EmitThinkingDelta(remaining.Content))
-			}
+			s.emitReasoningDelta(emit, remaining.Content)
 		} else {
-			s.ensureTextBlock(emit)
-			emit(s.builder.TextDelta(remaining.Content))
+			s.emitVisibleText(emit, remaining.Content)
 		}
 	}
+	s.flushReasoningDSML(emit)
 
 	heuristicText, heuristicTools := s.heuristicParser.Flush()
-	if heuristicText != "" {
-		s.ensureTextBlock(emit)
-		emit(s.builder.TextDelta(heuristicText))
-	}
+	s.emitVisibleText(emit, heuristicText)
+	s.flushContentDSML(emit)
 	for _, toolUse := range heuristicTools {
 		s.iterHeuristicToolUseSse(emit, toolUse)
 	}
@@ -576,23 +635,16 @@ func (s *Streamer) finalize(emit func(string), stop *bool) {
 
 	if remaining := s.thinkParser.Flush(); remaining != nil {
 		if remaining.Type == parsers.ThinkingContent {
-			if s.thinkingEnabled {
-				for _, ev := range s.builder.EnsureThinkingBlock() {
-					emit(ev)
-				}
-				emit(s.builder.EmitThinkingDelta(remaining.Content))
-			}
+			s.emitReasoningDelta(emit, remaining.Content)
 		} else {
-			s.ensureTextBlock(emit)
-			emit(s.builder.TextDelta(remaining.Content))
+			s.emitVisibleText(emit, remaining.Content)
 		}
 	}
+	s.flushReasoningDSML(emit)
 
 	heuristicText, heuristicTools := s.heuristicParser.Flush()
-	if heuristicText != "" {
-		s.ensureTextBlock(emit)
-		emit(s.builder.TextDelta(heuristicText))
-	}
+	s.emitVisibleText(emit, heuristicText)
+	s.flushContentDSML(emit)
 	for _, toolUse := range heuristicTools {
 		s.iterHeuristicToolUseSse(emit, toolUse)
 	}
@@ -637,7 +689,10 @@ func (s *Streamer) finalize(emit func(string), stop *bool) {
 						}
 					}
 				} else {
-					repaired := repairTruncatedJson(raw)
+					repaired := raw
+					if s.defend {
+						repaired = repairTruncatedJson(raw)
+					}
 					s.toolArgAccum[toolIndex] = repaired
 					emit(s.builder.EmitToolDelta(toolIndex, repaired))
 				}
@@ -669,9 +724,12 @@ func (s *Streamer) finalize(emit func(string), stop *bool) {
 
 	// Flush task arg buffers with JSON repair fallback.
 	for _, out := range s.builder.FlushTaskArgBuffers() {
-		repaired := repairTruncatedJson(out.Args)
-		s.toolArgAccum[out.ToolIndex] = repaired
-		emit(s.builder.EmitToolDelta(out.ToolIndex, repaired))
+		args := out.Args
+		if s.defend {
+			args = repairTruncatedJson(out.Args)
+		}
+		s.toolArgAccum[out.ToolIndex] = args
+		emit(s.builder.EmitToolDelta(out.ToolIndex, args))
 	}
 
 	// Close all blocks — thinking blocks get signature_delta before stop.
@@ -771,8 +829,13 @@ func (s *Streamer) processToolCall(emit func(string), tc openai.ToolCallDelta) {
 		// as empty (dumped 2026-08-28 — kimi-k3 Bash:0 doom loop). Ids are
 		// opaque downstream and tool_results echo whatever was issued here,
 		// so always issue a fresh unique one (once per tool index; later
-		// fragments of the same call repeat the id).
-		s.builder.SetStreamToolID(tcIndex, "toolu_"+uuidV4())
+		// fragments of the same call repeat the id). When the master defense
+		// switch is off, the upstream id passes through unchanged instead.
+		if s.defend {
+			s.builder.SetStreamToolID(tcIndex, "toolu_"+uuidV4())
+		} else {
+			s.builder.SetStreamToolID(tcIndex, tcID)
+		}
 	}
 	if tc.Function.Name != nil {
 		s.builder.RegisterToolName(tcIndex, fnName)

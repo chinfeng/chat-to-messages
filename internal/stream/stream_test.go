@@ -1353,3 +1353,109 @@ func TestStreamEmptyTurnGuardSkipsLengthFinish(t *testing.T) {
 		t.Fatalf("expected max_tokens mapping, got %s", events[len(events)-2])
 	}
 }
+
+// ---- upstream-bug defenses: DSML residue + switch-off passthrough ----
+
+// allEventsWithOpts runs a full stream with explicit Options.
+func allEventsWithOpts(t *testing.T, body string, request *convert.RequestData, opts *Options) []string {
+	t.Helper()
+	chunks := chunksFromSSE(t, body)
+	st := NewStreamer(context.Background(), seqFromSlice(chunks), request, 10, true, nil, opts)
+	events, err := collect(t, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// DSML 标记只泄漏进 content 时：下游不得看到任何 DSML 文本，原生
+// tool_call 仍须正常产出（上游其实解析出了工具调用，只是多吐了标记）。
+func TestStreamStripsDSMLResidueFromContent(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"content":"\n\n<｜DSML｜ calls>\n"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, "DSML") {
+		t.Errorf("DSML residue leaked downstream: %s", joined)
+	}
+	if strings.Contains(joined, `"type":"text_delta"`) {
+		t.Errorf("marker-only content must not open a text block: %s", joined)
+	}
+	if !strings.Contains(joined, `"name":"Bash"`) {
+		t.Errorf("native tool call lost: %s", joined)
+	}
+}
+
+// DSML 标记被拆成两个 reasoning_content 分片时，流式过滤器要跨块持有，
+// 不能把半个标记当思考内容发出去。
+func TestStreamStripsDSMLResidueFromReasoningSplit(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"reasoning_content":"\n\n<｜DSML｜ calls"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"reasoning_content":">\n"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"content":"answer"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEvents(t, body, req(t, "m1"))
+	joined := strings.Join(ev, "\n")
+	if strings.Contains(joined, "DSML") {
+		t.Errorf("DSML residue leaked downstream: %s", joined)
+	}
+	if !strings.Contains(joined, `"text":"answer"`) {
+		t.Errorf("visible answer missing: %s", joined)
+	}
+}
+
+// 总开关关闭：content / reasoning_content 中的 DSML 原样透传，作为对照基线。
+func TestStreamDSMLPassthroughWhenDefensesDisabled(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"reasoning_content":"\n\n<｜DSML｜ calls>\n"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"content":"\n\n<｜DSML｜ calls>\n"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEventsWithOpts(t, body, req(t, "m1"), &Options{DisableUpstreamBugDefenses: true})
+	joined := strings.Join(ev, "\n")
+	if strings.Count(joined, "DSML") != 2 {
+		t.Errorf("raw DSML must pass through in both reasoning and content: %s", joined)
+	}
+}
+
+// 控制标记剥离也归总开关管：关闭后 <|begin_of_text|> 原样透传。
+func TestStreamControlTokenPassthroughWhenDefensesDisabled(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"content":"<|begin_of_text|>hello"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	enabled := strings.Join(allEvents(t, body, req(t, "m1")), "\n")
+	if strings.Contains(enabled, "begin_of_text") {
+		t.Errorf("control token must be stripped by default: %s", enabled)
+	}
+	disabled := strings.Join(allEventsWithOpts(t, body, req(t, "m1"), &Options{DisableUpstreamBugDefenses: true}), "\n")
+	if !strings.Contains(disabled, "begin_of_text") {
+		t.Errorf("control token must pass through when defenses are off: %s", disabled)
+	}
+}
+
+// 上游 tool id 重铸也归总开关管：关闭后 id 原样透传。
+func TestStreamToolIDPassthroughWhenDefensesDisabled(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"Bash:0","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	ev := allEventsWithOpts(t, body, req(t, "m1"), &Options{DisableUpstreamBugDefenses: true})
+	if id := toolUseID(t, ev); id != "Bash:0" {
+		t.Errorf("tool id = %q, want upstream id passed through", id)
+	}
+}
+
+// 截断 JSON 修复也归总开关管：关闭后孤儿的原始参数原样发出。
+func TestStreamTruncatedArgsNotRepairedWhenDefensesDisabled(t *testing.T) {
+	request := req(t, "m1")
+	request.Tools = []map[string]any{{"type": "custom", "name": "read_file", "input_schema": map[string]any{}}}
+	body := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"/tmp"}}]}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	if got := accumulatedPartialJSON(t, allEvents(t, body, request)); got != `{"path":"/tmp"}` {
+		t.Errorf("defenses on: accumulated = %q, want repaired JSON", got)
+	}
+	if got := accumulatedPartialJSON(t, allEventsWithOpts(t, body, request, &Options{DisableUpstreamBugDefenses: true})); got != `{"path":"/tmp` {
+		t.Errorf("defenses off: accumulated = %q, want raw truncated args", got)
+	}
+}

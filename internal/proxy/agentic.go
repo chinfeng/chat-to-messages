@@ -775,7 +775,11 @@ func handleServerToolRequest(w http.ResponseWriter, r *http.Request, cfg *config
 	}
 
 	inner := stream.NewStreamer(r.Context(), teeChunks, requestData, inputTokens, cfg.EnableThinking, session,
-		&stream.Options{SkipMessageLifecycle: true, StartingBlockIndex: builder.NextIndex()})
+		&stream.Options{
+			SkipMessageLifecycle:       true,
+			StartingBlockIndex:         builder.NextIndex(),
+			DisableUpstreamBugDefenses: !cfg.UpstreamBugDefenses,
+		})
 	for ev := range inner.Events() {
 		emit(ev)
 	}

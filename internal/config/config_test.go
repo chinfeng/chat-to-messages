@@ -402,6 +402,22 @@ func TestLoadGuardFlags(t *testing.T) {
 	}
 }
 
+// 上游 bug 兜底总开关：默认开启（保持现有行为），--no- 形式整体关闭。
+func TestLoadUpstreamBugDefenses(t *testing.T) {
+	if cfg := Load(nil); !cfg.UpstreamBugDefenses {
+		t.Error("UpstreamBugDefenses should default true")
+	}
+	if cfg := Load([]string{"--no-upstream-bug-defenses"}); cfg.UpstreamBugDefenses {
+		t.Error("--no-upstream-bug-defenses ignored")
+	}
+	if cfg := Load([]string{"--upstream-bug-defenses"}); !cfg.UpstreamBugDefenses {
+		t.Error("--upstream-bug-defenses ignored")
+	}
+	if cfg := Load([]string{"--upstream-bug-defenses=false"}); cfg.UpstreamBugDefenses {
+		t.Error("--upstream-bug-defenses=false ignored")
+	}
+}
+
 func TestLoadEmptyTurnRetriesClamp(t *testing.T) {
 	cfg := Load([]string{"--empty-turn-retries", "9"})
 	if cfg.EmptyTurnMaxRetries != 2 {

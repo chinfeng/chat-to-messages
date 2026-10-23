@@ -105,6 +105,9 @@ func testConfig(upstreamURL string) *config.Config {
 		UpstreamAPIKey:  "sk-upstream",
 		Port:            8082,
 		EnableThinking:  true,
+		// config.Load defaults this to true; hand-built configs must set it or
+		// every upstream-bug defense is silently off.
+		UpstreamBugDefenses: true,
 	}
 }
 
@@ -1549,4 +1552,56 @@ func mustReadAll(t *testing.T, resp *http.Response) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestDSMLDefensePreservesRawUpstreamLogs pins the diagnostic guarantee: the
+// raw upstream SSE and the client's verbatim request survive in the dumps,
+// while the downstream response and the cleaned replay history do not carry
+// the leaked DSML marker.
+func TestDSMLDefensePreservesRawUpstreamLogs(t *testing.T) {
+	const marker = "<｜DSML｜ calls>"
+	upstreamBody := `data: {"choices":[{"delta":{"content":"\n\n` + marker + `\n"}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"Bash:0","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}}]}}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up := mockUpstream(t, upstreamBody, 200)
+	cfg := testConfig(up.URL)
+	cfg.DumpDir = t.TempDir()
+	h := NewHandler(cfg)
+
+	reqBody := `{"model":"deepseek-v4","messages":[` +
+		`{"role":"assistant","content":[{"type":"text","text":"\n\n` + marker + `\n"}]},` +
+		`{"role":"user","content":"hi"}],"stream":true}`
+	resp := postMessages(t, h, reqBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	io.Copy(io.Discard, resp.Body)
+
+	entries, err := os.ReadDir(filepath.Join(cfg.DumpDir, "completed"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("completed dump missing: %v (%d entries)", err, len(entries))
+	}
+	dir := filepath.Join(cfg.DumpDir, "completed", entries[0].Name())
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(b)
+	}
+
+	if got := read("upstream-response.log"); !strings.Contains(got, "DSML") {
+		t.Error("raw upstream response must retain the leaked DSML marker")
+	}
+	if got := read("downstream-response.log"); strings.Contains(got, "DSML") {
+		t.Errorf("downstream response leaked DSML residue:\n%s", got)
+	}
+	if got := read("downstream-request.log"); !strings.Contains(got, "DSML") {
+		t.Error("downstream request dump must retain the client payload verbatim")
+	}
+	if got := read("upstream-request.log"); strings.Contains(got, "DSML") {
+		t.Errorf("replayed history sent upstream still carries DSML:\n%s", got)
+	}
 }

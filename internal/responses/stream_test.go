@@ -281,3 +281,96 @@ func TestTranslatorUsageFallbackEstimate(t *testing.T) {
 		t.Fatalf("usage fallback estimate missing: %v", events)
 	}
 }
+
+// ---- upstream-bug defenses: DSML residue + switch-off passthrough ----
+
+// runTranslatorOpts is runTranslator with explicit translator options.
+func runTranslatorOpts(t *testing.T, req *Request, chunks []openai.Chunk, opts TranslatorOptions) []string {
+	t.Helper()
+	tr := NewTranslatorWithOptions(req, "resp_test", opts)
+	var events []string
+	for _, c := range chunks {
+		events = append(events, tr.Process(c)...)
+	}
+	events = append(events, tr.Finish()...)
+	return events
+}
+
+// DSML 标记泄漏进 reasoning/content 时：Responses 下游不得看到标记，
+// 原生 tool_call 仍须产出 function_call。
+func TestTranslatorStripsDSMLResidue(t *testing.T) {
+	var req Request
+	req.Model = "m"
+	chunks := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ReasoningContent: sp("\n\n<｜DSML｜ calls>\n")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{Content: sp("\n\n<｜DSML｜ calls>\n")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ToolCalls: []openai.ToolCallDelta{
+			{Index: 0, ID: sp("c1"), Function: openai.ToolCallFunction{Name: sp("Bash"), Arguments: sp(`{"command":"ls"}`)}},
+		}}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{}, FinishReason: sp("tool_calls")}}},
+		{Done: true},
+	}
+	events := runTranslator(t, &req, chunks)
+	joined := strings.Join(events, "")
+	if strings.Contains(joined, "DSML") {
+		t.Errorf("DSML residue leaked downstream: %s", joined)
+	}
+	if strings.Contains(joined, "response.output_text.delta") {
+		t.Errorf("marker-only content must not open a message item: %s", joined)
+	}
+	if !strings.Contains(joined, `"name":"Bash"`) {
+		t.Errorf("native tool call lost: %s", joined)
+	}
+}
+
+// 总开关关闭：DSML 原样透传（对照基线）。
+func TestTranslatorDSMLPassthroughWhenDefensesDisabled(t *testing.T) {
+	var req Request
+	req.Model = "m"
+	chunks := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ReasoningContent: sp("\n\n<｜DSML｜ calls>\n")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{Content: sp("\n\n<｜DSML｜ calls>\n")}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{}, FinishReason: sp("stop")}}},
+		{Done: true},
+	}
+	joined := strings.Join(runTranslatorOpts(t, &req, chunks, TranslatorOptions{DisableUpstreamBugDefenses: true}), "")
+	if !strings.Contains(joined, "DSML") {
+		t.Errorf("raw DSML must pass through when defenses are off: %s", joined)
+	}
+}
+
+// 上游 call_id 重铸也归总开关管：关闭后上游 id 原样作为 call_id 透传。
+func TestTranslatorToolCallIDPassthroughWhenDefensesDisabled(t *testing.T) {
+	var req Request
+	req.Model = "m"
+	chunks := []openai.Chunk{
+		{Choices: []openai.Choice{{Delta: &openai.Delta{ToolCalls: []openai.ToolCallDelta{
+			{Index: 0, ID: sp("Bash:0"), Function: openai.ToolCallFunction{Name: sp("Bash"), Arguments: sp(`{"command":"ls"}`)}},
+		}}}}},
+		{Choices: []openai.Choice{{Delta: &openai.Delta{}, FinishReason: sp("tool_calls")}}},
+		{Done: true},
+	}
+	joined := strings.Join(runTranslatorOpts(t, &req, chunks, TranslatorOptions{DisableUpstreamBugDefenses: true}), "")
+	if !strings.Contains(joined, `"call_id":"Bash:0"`) {
+		t.Errorf("upstream call id must pass through when defenses are off: %s", joined)
+	}
+}
+
+// 控制标记剥离在 Responses 路径同样归总开关管。
+func TestTranslatorControlTokenPassthroughWhenDefensesDisabled(t *testing.T) {
+	var req Request
+	req.Model = "m"
+	chunks := []openai.Chunk{
+		TextDelta("<|begin_of_text|>hello"),
+		{Choices: []openai.Choice{{Delta: &openai.Delta{}, FinishReason: sp("stop")}}},
+		{Done: true},
+	}
+	enabled := strings.Join(runTranslator(t, &req, chunks), "")
+	if strings.Contains(enabled, "begin_of_text") {
+		t.Errorf("control token must be stripped by default: %s", enabled)
+	}
+	disabled := strings.Join(runTranslatorOpts(t, &req, chunks, TranslatorOptions{DisableUpstreamBugDefenses: true}), "")
+	if !strings.Contains(disabled, "begin_of_text") {
+		t.Errorf("control token must pass through when defenses are off: %s", disabled)
+	}
+}

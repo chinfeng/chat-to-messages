@@ -113,6 +113,19 @@ func TestControlTokenStrip(t *testing.T) {
 	}
 }
 
+// 上游 bug 兜底总开关关闭时，控制标记必须原样透传，作为干净的对照基线。
+func TestControlTokenStripDisabled(t *testing.T) {
+	p := NewHeuristicToolParser()
+	p.SetControlTokenStripping(false)
+	if filtered, _ := p.Feed("<|begin_of_text|>hello"); filtered != "" {
+		t.Errorf("filtered = %q", filtered)
+	}
+	flText, _ := p.Flush()
+	if flText != "<|begin_of_text|>hello" {
+		t.Errorf("flush = %q, want raw control token preserved", flText)
+	}
+}
+
 func TestHeuristicFunctionHeaderTooLong(t *testing.T) {
 	p := NewHeuristicToolParser()
 	longPrefix := "●"

@@ -1287,3 +1287,72 @@ func TestBuildBaseRequestBodyThreadsSanitizeFlag(t *testing.T) {
 		t.Fatalf("unsanitized request altered content: %v", lastOff)
 	}
 }
+
+// --- upstream-bug defenses: DSML residue in replayed history ---
+
+// 上游回放的 assistant 历史里可能残留 DSML 标记（上游流式解析器泄漏，
+// 被客户端原样写回历史）。清理只作用于 assistant 的 text/thinking，
+// 不改写用户内容，也不改动入参（原始请求仍用于 dump）。
+func TestStripDSMLResidueFromMessages(t *testing.T) {
+	msgs := []anthropic.Message{
+		{Role: "assistant", Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{
+			{Type: "text", Text: "\n\n<｜DSML｜ calls>\n"},
+			{Type: "thinking", Thinking: "hmm <｜DSML｜tool_calls>"},
+			{Type: "text", Text: "keep me"},
+		}}},
+		{Role: "assistant", Content: anthropic.ContentValue{IsString: true, Str: "\n\n<｜DSML｜ calls>\n"}},
+		{Role: "user", Content: anthropic.ContentValue{IsString: true, Str: "user <｜DSML｜ calls> untouched"}},
+	}
+
+	got := StripDSMLResidueFromMessages(msgs)
+
+	blocks := got[0].Content.BlocksVal
+	if len(blocks) != 3 {
+		t.Fatalf("block count = %d, want 3", len(blocks))
+	}
+	if blocks[0].Text != "" {
+		t.Errorf("marker-only text = %q, want empty", blocks[0].Text)
+	}
+	if blocks[1].Thinking != "hmm " {
+		t.Errorf("thinking = %q, want residual marker removed", blocks[1].Thinking)
+	}
+	if blocks[2].Text != "keep me" {
+		t.Errorf("ordinary text = %q", blocks[2].Text)
+	}
+	if got[1].Content.Str != "" {
+		t.Errorf("string assistant content = %q, want empty", got[1].Content.Str)
+	}
+	if got[2].Content.Str != "user <｜DSML｜ calls> untouched" {
+		t.Errorf("user content must be untouched: %q", got[2].Content.Str)
+	}
+	if msgs[0].Content.BlocksVal[0].Text == "" {
+		t.Error("input messages were mutated; raw request dump must stay intact")
+	}
+}
+
+// BuildBaseRequestBody honors the master switch: enabled strips DSML residue
+// from the replayed history, disabled passes it through byte-for-byte.
+func TestBuildBaseRequestBodyStripsDSMLHistoryPerFlag(t *testing.T) {
+	mk := func() []anthropic.Message {
+		return decodeMessages(t, `[
+			{"role":"assistant","content":[{"type":"text","text":"\n\n<｜DSML｜ calls>\n"}]},
+			{"role":"user","content":"next"}
+		]`)
+	}
+
+	body, err := BuildBaseRequestBody(&RequestData{Model: "m", Messages: mk(), UpstreamBugDefenses: true}, nil, ReplayDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := jsonStr(t, body); strings.Contains(s, "DSML") {
+		t.Errorf("defenses enabled: DSML survived into upstream body: %s", s)
+	}
+
+	body, err = BuildBaseRequestBody(&RequestData{Model: "m", Messages: mk(), UpstreamBugDefenses: false}, nil, ReplayDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := jsonStr(t, body); !strings.Contains(s, "DSML") {
+		t.Errorf("defenses disabled: DSML should pass through: %s", s)
+	}
+}

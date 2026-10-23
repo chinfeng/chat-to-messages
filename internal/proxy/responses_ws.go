@@ -170,7 +170,9 @@ func runResponsesWSJob(ctx context.Context, cfg *config.Config, store *responses
 	session.WriteUpstreamRequest(headerMap(up.HTTP.Header), time.Now().UTC().Format(time.RFC3339), up.Wire)
 
 	responseID := responses.NewID("resp_")
-	tr := responses.NewTranslator(&req, responseID)
+	tr := responses.NewTranslatorWithOptions(&req, responseID, responses.TranslatorOptions{
+		DisableUpstreamBugDefenses: !cfg.UpstreamBugDefenses,
+	})
 	var downstreamChunks []string
 	emit := func(sseEvent string) {
 		downstreamChunks = append(downstreamChunks, sseEvent)

@@ -173,6 +173,8 @@ func TestResponsesWSEndToEnd(t *testing.T) {
 		UpstreamBaseURL:          up.URL,
 		UpstreamAPIKey:           "sk-upstream",
 		ResponsesStoreTTLMinutes: 1440,
+		// The tool-id regeneration defense is gated by the master switch.
+		UpstreamBugDefenses: true,
 	}
 	proxy := httptest.NewServer(NewHandler(cfg))
 	defer proxy.Close()

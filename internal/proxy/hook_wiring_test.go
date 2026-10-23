@@ -342,6 +342,8 @@ func TestHandleMessagesEvictionStillWired(t *testing.T) {
 		UpstreamBaseURL:   upstream.URL,
 		UpstreamAPIKey:    "k",
 		MaxUpstreamImages: 1,
+		// Eviction is an upstream-bug defense, gated by the master switch.
+		UpstreamBugDefenses: true,
 	}
 	h := NewHandler(cfg)
 

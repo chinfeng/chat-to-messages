@@ -171,7 +171,12 @@ func NewHandler(cfg *config.Config) http.Handler {
 // configured non-visual model globs.
 func buildHookRegistry(cfg *config.Config) *hook.Registry {
 	r := hook.NewRegistry()
-	r.Register(&hook.EvictionHook{Keep: cfg.MaxUpstreamImages})
+	// Image eviction is an upstream-bug defense (the z-ai channel rejects
+	// requests with >= 8 images, dumped 2026-09-12), so the master switch
+	// gates it in addition to --max-upstream-images.
+	if cfg.UpstreamBugDefenses {
+		r.Register(&hook.EvictionHook{Keep: cfg.MaxUpstreamImages})
+	}
 	if len(cfg.HookImageCaptionPatterns) > 0 {
 		r.Register(caption.New(cfg))
 	}
@@ -624,6 +629,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 		ServerTools:   req.ServerTools,
 
 		SanitizeClientMetaTurns: cfg.SanitizeClientMetaTurns,
+		UpstreamBugDefenses:     cfg.UpstreamBugDefenses,
 	}
 	// Raw char/4 estimate, then scaled by the in-memory per-model tokenizer
 	// ratio learned from completed turns (resets to 1.0 on restart): upstream
@@ -687,19 +693,24 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 	chunks := openai.IterSSEChunks(r.Context(), upstreamBody, &rawUpstream)
 	var downstreamAborted atomic.Bool
 
-	streamer := stream.NewStreamer(r.Context(), chunks, requestData, inputTokens, cfg.EnableThinking, session,
-		&stream.Options{
-			IsDownstreamAborted: func() bool { return downstreamAborted.Load() },
-			InvisibleTurnRetry:  emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey),
-			MidStreamRetry:      midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey),
-			// Ratio update point for successful turns: finalize fires only on
-			// graceful completion, usageInfo only exists when the upstream sent
-			// the usage chunk. Covers streaming AND non-streaming clients —
-			// both consume this same streamer.
-			OnCompletedUsage: func(promptTokens int64) {
-				usage.Default.Observe(req.Model, rawEstimate, promptTokens)
-			},
-		})
+	streamOpts := &stream.Options{
+		IsDownstreamAborted:        func() bool { return downstreamAborted.Load() },
+		DisableUpstreamBugDefenses: !cfg.UpstreamBugDefenses,
+		// Ratio update point for successful turns: finalize fires only on
+		// graceful completion, usageInfo only exists when the upstream sent
+		// the usage chunk. Covers streaming AND non-streaming clients —
+		// both consume this same streamer.
+		OnCompletedUsage: func(promptTokens int64) {
+			usage.Default.Observe(req.Model, rawEstimate, promptTokens)
+		},
+	}
+	// Guard retries are upstream-bug defenses too: the master switch must be
+	// on AND each guard's own setting must allow it.
+	if cfg.UpstreamBugDefenses {
+		streamOpts.InvisibleTurnRetry = emptyTurnRetryHook(r.Context(), cfg, session, requestData, apiKey)
+		streamOpts.MidStreamRetry = midStreamRetryHook(r.Context(), cfg, session, requestData, apiKey)
+	}
+	streamer := stream.NewStreamer(r.Context(), chunks, requestData, inputTokens, cfg.EnableThinking, session, streamOpts)
 
 	// Non-streaming client (stream omitted or false — the Anthropic default):
 	// aggregate into ONE Message JSON. Claude Code's model-validation probe and

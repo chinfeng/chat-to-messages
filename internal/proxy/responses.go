@@ -143,7 +143,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request, cfg *config.Config,
 	// no pump goroutine: the handler drains IterSSEChunks directly, the client
 	// disconnect cancels the read through r.Context().
 	responseID := responses.NewID("resp_")
-	tr := responses.NewTranslator(&req, responseID)
+	tr := responses.NewTranslatorWithOptions(&req, responseID, responses.TranslatorOptions{
+		DisableUpstreamBugDefenses: !cfg.UpstreamBugDefenses,
+	})
 	var downstreamChunks []string
 
 	var rawUpstream string
