@@ -132,6 +132,25 @@ func TestBuildChatBodyReasoningReplayModes(t *testing.T) {
 	}
 }
 
+// DeepSeek thinking mode requires reasoning_content on tool-call assistant
+// turns even when the client history carries no reasoning item for that turn.
+func TestBuildChatBodyBackfillsMissingReasoningOnToolCalls(t *testing.T) {
+	history := []Item{
+		{Type: "function_call", CallID: "call_1", Name: "lookup", Arguments: `{}`},
+		{Type: "function_call_output", CallID: "call_1", Output: ContentValue{IsString: true, Str: "res"}},
+	}
+	var req Request
+	req.Model = "m"
+	body, err := BuildChatBody(&req, history, convert.ReplayReasoningContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := messagesOf(t, body)[0]
+	if rc, _ := assistant["reasoning_content"].(string); rc == "" {
+		t.Fatalf("reasoning_content missing/empty on tool-call turn: %v", assistant)
+	}
+}
+
 func TestBuildChatBodyRejections(t *testing.T) {
 	cases := []struct {
 		name string

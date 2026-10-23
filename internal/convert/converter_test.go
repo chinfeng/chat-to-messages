@@ -481,6 +481,30 @@ func TestConvertReasoningContentStringMessage(t *testing.T) {
 	}
 }
 
+// DeepSeek's thinking mode 400s when the current tool-call assistant turn
+// carries no reasoning_content. The client can only replay thinking blocks it
+// actually received; a turn generated with zero reasoning tokens has none, so
+// the field must still be emitted (non-empty) for the upstream contract.
+func TestConvertReasoningContentToolCallWithoutThinking(t *testing.T) {
+	msgs := decodeMessages(t, `[
+		{"role":"user","content":"do it"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"x"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"ok"}]}
+	]`)
+	got := convert(t, msgs, ReplayReasoningContent)
+	if got[1]["role"] != "assistant" || got[1]["tool_calls"] == nil {
+		t.Fatalf("expected assistant tool-call message, got %v", got[1])
+	}
+	if rc, _ := got[1]["reasoning_content"].(string); rc == "" {
+		t.Fatalf("reasoning_content missing/empty on tool-call turn: %v", got[1])
+	}
+
+	got = convert(t, msgs, ReplayThinkTags)
+	if _, ok := got[1]["reasoning_content"]; ok {
+		t.Errorf("reasoning_content must stay absent in think_tags mode: %v", got[1])
+	}
+}
+
 // TS: converts tool_use blocks to tool_calls.
 func TestConvertToolUseToToolCalls(t *testing.T) {
 	msgs := []anthropic.Message{{Role: "assistant", Content: anthropic.ContentValue{BlocksVal: []anthropic.ContentBlock{

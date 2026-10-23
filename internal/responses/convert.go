@@ -54,6 +54,10 @@ func BuildChatBody(req *Request, history []Item, replayMode convert.ReasoningRep
 		case convert.ReplayReasoningContent:
 			if r := strings.Join(pendingReasoning, "\n"); r != "" {
 				msg["reasoning_content"] = r
+			} else if len(pendingCalls) > 0 {
+				// DeepSeek's thinking mode rejects a tool-call turn that omits
+				// the field, even when the model emitted no reasoning at all.
+				msg["reasoning_content"] = convert.ReplayMissingReasoning
 			}
 		}
 		// ReplayDisabled (or a mode with no reasoning buffered): drop.

@@ -261,6 +261,32 @@ func cleanReasoningContent(value *string) (string, bool) {
 	return *value, true
 }
 
+// ReplayMissingReasoning is the non-empty stand-in for a tool-call assistant
+// turn that has no thinking block to replay. DeepSeek's thinking mode rejects
+// the current turn with 400 when reasoning_content is absent ("must be passed
+// back to the API"); Kimi treats a missing field as out-of-distribution. The
+// placeholder must be non-empty — some gateways drop empty reasoning_content.
+const ReplayMissingReasoning = "(reasoning unavailable)"
+
+// backfillReplayReasoning guarantees every assistant tool-call turn carries a
+// non-empty reasoning_content under ReplayReasoningContent. Turns the model
+// answered with zero reasoning tokens (reasoning_tokens: 0) leave the client
+// with nothing to replay, but the upstream still requires the field.
+func backfillReplayReasoning(messages []map[string]any) {
+	for _, msg := range messages {
+		if msg["role"] != "assistant" {
+			continue
+		}
+		if _, ok := msg["tool_calls"]; !ok {
+			continue
+		}
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			continue
+		}
+		msg["reasoning_content"] = ReplayMissingReasoning
+	}
+}
+
 // pendingAfterTools mirrors the PendingAfterTools interface.
 type pendingAfterTools struct {
 	remainingToolIds     map[string]bool
@@ -885,6 +911,10 @@ func ConvertMessages(messages []anthropic.Message, reasoningReplay ReasoningRepl
 
 	if pending != nil && needsDeferred(pending) {
 		result = append(result, deferredPostToolToMessages(pending)...)
+	}
+
+	if reasoningReplay == ReplayReasoningContent {
+		backfillReplayReasoning(result)
 	}
 
 	return result, nil
