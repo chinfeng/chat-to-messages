@@ -1380,3 +1380,60 @@ func TestBuildBaseRequestBodyStripsDSMLHistoryPerFlag(t *testing.T) {
 		t.Errorf("defenses disabled: DSML should pass through: %s", s)
 	}
 }
+
+// Mistral (via newapi relays) rejects the whole request with 400 "Invalid
+// request" when a role=system message follows the first assistant turn
+// (dumped 2026-10-29, mistralai/mistral-large-4-1t-a52b agent loop: Claude
+// Code sends <system-reminder> updates as mid-history system messages). Under
+// the master switch those late system messages are demoted to user turns —
+// including block-content ones ConvertMessages would otherwise drop — while
+// leading system messages (before any assistant) keep their role.
+func TestBuildBaseRequestBodyDemotesLateSystemPerFlag(t *testing.T) {
+	mk := func() []anthropic.Message {
+		return decodeMessages(t, `[
+			{"role":"system","content":"leading reminder"},
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"x"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},
+			{"role":"system","content":"## Exited Plan Mode"},
+			{"role":"system","content":[{"type":"text","text":"block reminder"}]},
+			{"role":"user","content":"continue"}
+		]`)
+	}
+	roles := func(body map[string]any) []string {
+		msgs, _ := body["messages"].([]any)
+		var out []string
+		for _, m := range msgs {
+			out = append(out, m.(map[string]any)["role"].(string))
+		}
+		return out
+	}
+
+	body, err := BuildBaseRequestBody(&RequestData{Model: "m", Messages: mk(), UpstreamBugDefenses: true}, nil, ReplayDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := roles(body)
+	want := []string{"system", "user", "assistant", "tool", "user", "user", "user"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("defenses enabled: roles = %v, want %v", got, want)
+	}
+	if s := jsonStr(t, body); !strings.Contains(s, "Exited Plan Mode") || !strings.Contains(s, "block reminder") {
+		t.Errorf("demoted system text lost from upstream body: %s", s)
+	}
+
+	body, err = BuildBaseRequestBody(&RequestData{Model: "m", Messages: mk(), UpstreamBugDefenses: false}, nil, ReplayDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := jsonStr(t, body); !strings.Contains(s, `"role":"system"`) {
+		t.Errorf("defenses disabled: late system should pass through: %s", s)
+	}
+
+	// Input must not be mutated — the raw downstream dump stays verbatim.
+	msgs := mk()
+	DemoteLateSystemMessages(msgs)
+	if msgs[4].Role != "system" || msgs[5].Role != "system" {
+		t.Errorf("input messages mutated: roles = %q, %q; want both still \"system\"", msgs[4].Role, msgs[5].Role)
+	}
+}

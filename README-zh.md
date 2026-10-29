@@ -135,7 +135,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--port` | `8082` | HTTP 监听端口 |
 | `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
 | `--no-enable-thinking` | — | 禁用 thinking 转换 |
-| `--upstream-bug-defenses` | `true` | 上游 BUG 兜底总开关（用 `--no-upstream-bug-defenses` 关闭）：清理流式 content/reasoning 及重放历史中泄漏的 DSML 标记（DeepSeek 的 `<｜DSML｜ calls>`）、剥离供应商控制标记、修复截断的工具参数 JSON、重铸上游 tool_use id。关闭后其管辖的守卫（`--empty-turn-guard`、断流重试、`--max-upstream-images` 图片裁剪）一并停用——注意静默看门狗本身仍生效。原始 dump 始终保留未改动的上游字节与客户端原样请求，便于排查 |
+| `--upstream-bug-defenses` | `true` | 上游 BUG 兜底总开关（用 `--no-upstream-bug-defenses` 关闭）：清理流式 content/reasoning 及重放历史中泄漏的 DSML 标记（DeepSeek 的 `<｜DSML｜ calls>`）、剥离供应商控制标记、修复截断的工具参数 JSON、重铸上游 tool_use id、将历史中间的 `system` 消息降级为 `user`（Mistral 在 `system` 出现在首个 assistant 之后时会用 400 拒绝整个请求；2026-10-29 dump，mistral-large agent loop 事故）。关闭后其管辖的守卫（`--empty-turn-guard`、断流重试、`--max-upstream-images` 图片裁剪）一并停用——注意静默看门狗本身仍生效。原始 dump 始终保留未改动的上游字节与客户端原样请求，便于排查 |
 | `--sanitize-client-meta-turns` | `true` | 将 Claude Code 注入的合成用户轮（`[Your previous response had no visible output...]`、`(no content)`、中断标记）规约为中性续作指令后再重放给上游模型 |
 | `--empty-turn-guard` | `true` | 空回合守卫：回合以推理结束但既无可见文本也无工具调用时，自动向上游发起有界重试（针对 kimi-k3/GLM 塌方模式） |
 | `--empty-turn-retries` | `2` | 每个请求允许的空回合重试次数上限（0-5） |

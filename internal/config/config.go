@@ -71,11 +71,13 @@ type Config struct {
 	// UpstreamBugDefenses is the master switch for defenses against known
 	// upstream defects: DeepSeek DSML residue cleanup, ASCII control-token
 	// stripping, truncated tool-argument JSON repair, downstream tool_use id
-	// regeneration, and (ANDed with their own flags) the empty-turn guard,
-	// mid-stream stall retry, and image eviction. Default true preserves the
-	// long-standing behavior; --no-upstream-bug-defenses yields a clean
-	// passthrough baseline for diagnosing whether a problem is ours or the
-	// upstream's.
+	// regeneration, demotion of mid-history system messages to user turns
+	// (Mistral 400s the whole request when a system role follows an assistant
+	// turn; dumped 2026-10-29, mistral-large agent loop), and (ANDed with
+	// their own flags) the empty-turn guard, mid-stream stall retry, and image
+	// eviction. Default true preserves the long-standing behavior;
+	// --no-upstream-bug-defenses yields a clean passthrough baseline for
+	// diagnosing whether a problem is ours or the upstream's.
 	UpstreamBugDefenses bool
 
 	// SanitizeClientMetaTurns normalizes Claude Code's synthetic user meta

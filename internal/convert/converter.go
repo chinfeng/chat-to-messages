@@ -1077,6 +1077,46 @@ func StripDSMLResidueFromMessages(messages []anthropic.Message) []anthropic.Mess
 	return out
 }
 
+// DemoteLateSystemMessages returns messages with any role="system" message
+// that appears AFTER the first assistant message re-rolled to "user".
+// Mistral — reached through newapi relays — rejects the whole
+// chat/completions request with 400 "Invalid request" when a system role
+// follows an assistant turn; system messages are only accepted ahead of the
+// first assistant message (dumped 2026-10-29: every
+// mistralai/mistral-large-4-1t-a52b agent-loop request in dumps/failed died
+// this way, because Claude Code emits <system-reminder> updates as
+// role:"system" messages mid-history). Re-roling keeps the text in context as
+// an ordinary user turn and also rescues block-content system messages that
+// ConvertMessages would otherwise drop entirely (its block branch only
+// handles role="user"). The input is never mutated — the raw downstream dump
+// must stay verbatim — the slice is copied only when a demotion is needed.
+func DemoteLateSystemMessages(messages []anthropic.Message) []anthropic.Message {
+	seenAssistant := false
+	needs := false
+	for i := range messages {
+		if messages[i].Role == "assistant" {
+			seenAssistant = true
+		} else if seenAssistant && messages[i].Role == "system" {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return messages
+	}
+	out := make([]anthropic.Message, len(messages))
+	copy(out, messages)
+	seenAssistant = false
+	for i := range out {
+		if out[i].Role == "assistant" {
+			seenAssistant = true
+		} else if seenAssistant && out[i].Role == "system" {
+			out[i].Role = "user"
+		}
+	}
+	return out
+}
+
 // BuildBaseRequestBody mirrors buildBaseRequestBody() in converter.ts.
 // Server tools are collected from BOTH the server_tools field and the tools
 // array (Claude Code puts server tools in the tools array), deduplicated by
@@ -1086,6 +1126,7 @@ func BuildBaseRequestBody(req *RequestData, defaultMaxTokens any, reasoningRepla
 	messagesIn := req.Messages
 	if req.UpstreamBugDefenses {
 		messagesIn = StripDSMLResidueFromMessages(messagesIn)
+		messagesIn = DemoteLateSystemMessages(messagesIn)
 	}
 	messages, err := ConvertMessages(messagesIn, reasoningReplay, req.SanitizeClientMetaTurns)
 	if err != nil {
