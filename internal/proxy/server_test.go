@@ -1015,6 +1015,7 @@ func TestClientAbortCategorized(t *testing.T) {
 	up, flushed := mockUpstreamDelayed(t, chunks, 5*time.Millisecond)
 	cfg := testConfig(up.URL)
 	cfg.DumpDir = t.TempDir()
+	cfg.MidStreamStallTimeout = 120 // arm the mid-stream retry hook so the guard below is exercised
 	h := NewHandler(cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1050,6 +1051,11 @@ func TestClientAbortCategorized(t *testing.T) {
 	}
 	if strings.Contains(string(upResp), "Reason: upstream_abort") {
 		t.Errorf("upstream-response.log = %s", upResp)
+	}
+	// Client abort breaks the upstream read via Body.Close(); the retry hook
+	// must recognize the canceled ctx and NOT log a misleading attempt-2 file.
+	if _, err := os.Stat(filepath.Join(renamedDir, "upstream-request-attempt-2.log")); err == nil {
+		t.Errorf("client abort must not write upstream-request-attempt-2.log")
 	}
 }
 

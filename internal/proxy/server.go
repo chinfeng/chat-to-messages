@@ -389,6 +389,9 @@ func emptyTurnRetryHook(ctx context.Context, cfg *config.Config, session *dump.S
 		if !cfg.EmptyTurnGuard || attempt > cfg.EmptyTurnMaxRetries {
 			return nil
 		}
+		if ctx.Err() != nil {
+			return nil // client already gone: don't retry into a canceled context
+		}
 		attemptNo := attempt + 1 // dump numbering: primary request = attempt 1
 
 		retryReq := *requestData
@@ -497,6 +500,9 @@ func midStreamRetryHook(ctx context.Context, cfg *config.Config, session *dump.S
 	return func(attempt int, err error) iter.Seq[openai.Chunk] {
 		if window <= 0 || attempt > 2 {
 			return nil
+		}
+		if ctx.Err() != nil {
+			return nil // client already gone: this abort was self-induced by closing the upstream body, not a real upstream abort
 		}
 		fmt.Fprintln(os.Stderr, "chat-to-messages: mid-stream abort, retrying upstream (attempt", attempt, "):", err)
 		attemptNo := attempt + 1 // dump numbering: primary request = attempt 1
