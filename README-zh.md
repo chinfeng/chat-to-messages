@@ -148,6 +148,8 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--image-caption-cache-ttl` | `24h` | 同一图片的描述复用时长（跨多轮/重试）；`0` 禁用缓存 |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--reasoning-replay` | `think_tags` | 助手 thinking 块回放给上游的方式：`think_tags`、`reasoning_content` 或 `disabled`。接受裸模式（全局默认）或 `glob=mode` 按模型规则（可重复指定，首个匹配生效）；见下方说明 |
+| `--pass-through-included` | — | 逗号分隔的模型 glob：这些模型的 `/v1/messages` 请求原样透传到上游 `/v1/messages`（白名单：仅列表内模型透传）。与 `--pass-through-excluded` 互斥；上游返回 404 时回退为转换流程。无论透传与否都会写完整 dump 日志 |
+| `--pass-through-excluded` | — | 逗号分隔的模型 glob：这些模型始终走转换（黑名单：其余模型都透传到上游 `/v1/messages`）。兼容别名 `--pass-throuth-excluded`。与 `--pass-through-included` 互斥；上游返回 404 时回退为转换流程。无论透传与否都会写完整 dump 日志 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
 | `--dump-retention-days` | `3` | 自动清理转储目录中 n 天前的会话（启动时清扫一次，之后每小时一次）；仅在指定了 `--dump` 时生效，`0` 禁用清理 |
 | `--enable-web-search` | `false` | 启用代理端 Web 搜索 |

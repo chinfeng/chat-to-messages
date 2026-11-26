@@ -496,3 +496,60 @@ func TestResolveReasoningReplay(t *testing.T) {
 		t.Errorf("nil rules = %q, want fallback %q", got, ReplayModeThinkTags)
 	}
 }
+
+func TestLoadPassThroughDefaults(t *testing.T) {
+	cfg := Load(nil)
+	if len(cfg.PassThroughIncluded) != 0 || len(cfg.PassThroughExcluded) != 0 {
+		t.Errorf("PassThrough = %v / %v, want both empty", cfg.PassThroughIncluded, cfg.PassThroughExcluded)
+	}
+}
+
+func TestLoadPassThroughIncludedCommaSeparated(t *testing.T) {
+	cfg := Load([]string{"--pass-through-included", "glm-5, moonshotai/kimi-k*, ,"})
+	want := []string{"glm-5", "moonshotai/kimi-k*"}
+	if !reflect.DeepEqual(cfg.PassThroughIncluded, want) {
+		t.Errorf("PassThroughIncluded = %#v, want %#v", cfg.PassThroughIncluded, want)
+	}
+	if len(cfg.PassThroughExcluded) != 0 {
+		t.Errorf("PassThroughExcluded = %v, want empty", cfg.PassThroughExcluded)
+	}
+}
+
+func TestLoadPassThroughExcludedEqualsFormAndTypoAlias(t *testing.T) {
+	cfg := Load([]string{"--pass-through-excluded=deepseek*, qwen*"})
+	want := []string{"deepseek*", "qwen*"}
+	if !reflect.DeepEqual(cfg.PassThroughExcluded, want) {
+		t.Errorf("PassThroughExcluded = %#v, want %#v", cfg.PassThroughExcluded, want)
+	}
+	cfg2 := Load([]string{"--pass-throuth-excluded", "glm-5"})
+	if want2 := []string{"glm-5"}; !reflect.DeepEqual(cfg2.PassThroughExcluded, want2) {
+		t.Errorf("typo alias PassThroughExcluded = %#v, want %#v", cfg2.PassThroughExcluded, want2)
+	}
+	// The canonical flag wins when both spellings are present.
+	cfg3 := Load([]string{"--pass-through-excluded", "a", "--pass-throuth-excluded", "b"})
+	if want3 := []string{"a"}; !reflect.DeepEqual(cfg3.PassThroughExcluded, want3) {
+		t.Errorf("canonical-over-typo PassThroughExcluded = %#v, want %#v", cfg3.PassThroughExcluded, want3)
+	}
+}
+
+func TestShouldPassThroughMessages(t *testing.T) {
+	cases := []struct {
+		model            string
+		included         []string
+		excluded         []string
+		want             bool
+	}{
+		{"glm-5", nil, nil, false},
+		{"glm-5", []string{"glm-*"}, nil, true},
+		{"kimi-k3", []string{"glm-*"}, nil, false},
+		{"deepseek-chat", nil, []string{"deepseek*"}, false},
+		{"glm-5", nil, []string{"deepseek*"}, true},
+		{"glm-5", nil, []string{"*"}, false},
+		{"exact-model", []string{"exact-model"}, nil, true},
+	}
+	for _, c := range cases {
+		if got := ShouldPassThroughMessages(c.model, c.included, c.excluded); got != c.want {
+			t.Errorf("ShouldPassThroughMessages(%q, %v, %v) = %v, want %v", c.model, c.included, c.excluded, got, c.want)
+		}
+	}
+}

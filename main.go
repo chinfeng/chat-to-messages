@@ -43,6 +43,12 @@ func main() {
 	if len(cfg.HookImageCaptionPatterns) > 0 {
 		fmt.Printf("  Image caption: %s (model %s)\n", joinAll(cfg.HookImageCaptionPatterns), cfg.ImageCaptionModel)
 	}
+	if len(cfg.PassThroughIncluded) > 0 {
+		fmt.Printf("  /v1/messages pass-through (included): %s\n", joinAll(cfg.PassThroughIncluded))
+	}
+	if len(cfg.PassThroughExcluded) > 0 {
+		fmt.Printf("  /v1/messages pass-through (excluded): %s\n", joinAll(cfg.PassThroughExcluded))
+	}
 	if len(cfg.ModelOverrides) > 0 {
 		fmt.Printf("  Model overrides:\n")
 		for _, e := range cfg.ModelOverrides {

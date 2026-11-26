@@ -1611,3 +1611,169 @@ func TestDSMLDefensePreservesRawUpstreamLogs(t *testing.T) {
 		t.Errorf("replayed history sent upstream still carries DSML:\n%s", got)
 	}
 }
+
+// messagesPassthroughUpstream records every request it receives and answers
+// /v1/messages with a native Anthropic SSE stream and /chat/completions with
+// an OpenAI SSE stream, so tests can tell which route the proxy took.
+func messagesPassthroughUpstream(t *testing.T, messagesStatus int) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var paths []string
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if r.URL.Path == "/v1/messages" {
+			if messagesStatus != 200 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(messagesStatus)
+				io.WriteString(w, `{"type":"error","error":{"type":"not_found_error","message":"no such route"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"+
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"native\"}}\n\n"+
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"converted\"}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]string, len(paths))
+		for i, p := range paths {
+			out[i] = p + " " + bodies[i]
+		}
+		return out
+	}
+}
+
+func TestMessagesPassthroughIncludedRelaysVerbatim(t *testing.T) {
+	up, requests := messagesPassthroughUpstream(t, 200)
+	cfg := testConfig(up.URL)
+	cfg.PassThroughIncluded = []string{"native-*"}
+	cfg.DumpDir = t.TempDir()
+	h := NewHandler(cfg)
+
+	raw := `{"model":"native-1","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp := postMessages(t, h, raw, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("ct = %q, want text/event-stream", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"text":"native"`) {
+		t.Errorf("downstream body missing native SSE content:\n%s", body)
+	}
+
+	got := requests()
+	if len(got) != 1 || !strings.HasPrefix(got[0], "/v1/messages ") {
+		t.Fatalf("upstream requests = %v, want exactly one /v1/messages", got)
+	}
+	if !strings.HasSuffix(got[0], raw) {
+		t.Errorf("passthrough body not verbatim:\n%s", got[0])
+	}
+
+	// Full dump logs even for passthrough.
+	entries, err := os.ReadDir(filepath.Join(cfg.DumpDir, "completed"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("completed dump missing: %v (%d entries)", err, len(entries))
+	}
+	dir := filepath.Join(cfg.DumpDir, "completed", entries[0].Name())
+	for _, name := range []string{"downstream-request.log", "upstream-request.log", "upstream-response.log", "downstream-response.log"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("passthrough dump missing %s: %v", name, err)
+		}
+	}
+	upReq, _ := os.ReadFile(filepath.Join(dir, "upstream-request.log"))
+	if !strings.Contains(string(upReq), raw) {
+		t.Error("upstream-request.log must contain the verbatim passthrough body")
+	}
+}
+
+func TestMessagesPassthroughExcludedConvertsListedModels(t *testing.T) {
+	up, requests := messagesPassthroughUpstream(t, 200)
+	cfg := testConfig(up.URL)
+	cfg.PassThroughExcluded = []string{"conv-*"}
+	h := NewHandler(cfg)
+
+	postMessages(t, h, `{"model":"conv-1","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+	postMessages(t, h, `{"model":"other-9","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+
+	got := requests()
+	if len(got) != 2 {
+		t.Fatalf("upstream requests = %v", got)
+	}
+	if !strings.HasPrefix(got[0], "/chat/completions ") {
+		t.Errorf("listed model must be converted, got %q", got[0])
+	}
+	if !strings.HasPrefix(got[1], "/v1/messages ") {
+		t.Errorf("unlisted model must pass through, got %q", got[1])
+	}
+}
+
+func TestMessagesPassthrough404FallsBackToConversion(t *testing.T) {
+	up, requests := messagesPassthroughUpstream(t, 404)
+	cfg := testConfig(up.URL)
+	cfg.PassThroughIncluded = []string{"native-*"}
+	cfg.DumpDir = t.TempDir()
+	h := NewHandler(cfg)
+
+	resp := postMessages(t, h, `{"model":"native-1","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "converted") {
+		t.Errorf("expected conversion fallback output, got:\n%s", body)
+	}
+
+	got := requests()
+	if len(got) != 2 || !strings.HasPrefix(got[0], "/v1/messages ") || !strings.HasPrefix(got[1], "/chat/completions ") {
+		t.Fatalf("upstream requests = %v, want /v1/messages then /chat/completions", got)
+	}
+
+	// The 404 passthrough attempt is preserved in the numbered attempt logs.
+	var dir string
+	for _, bucket := range []string{"completed", "failed", "upstream-aborted", "client-aborted"} {
+		entries, err := os.ReadDir(filepath.Join(cfg.DumpDir, bucket))
+		if err == nil && len(entries) > 0 {
+			dir = filepath.Join(cfg.DumpDir, bucket, entries[0].Name())
+			break
+		}
+	}
+	if dir == "" {
+		t.Fatal("no dump session found")
+	}
+	attReq, err := os.ReadFile(filepath.Join(dir, "upstream-request-attempt-2.log"))
+	if err != nil || !strings.Contains(string(attReq), "native-1") {
+		t.Errorf("upstream-request-attempt-2.log missing passthrough body: %v", err)
+	}
+	attRes, err := os.ReadFile(filepath.Join(dir, "upstream-response-attempt-2.log"))
+	if err != nil || !strings.Contains(string(attRes), "404") || !strings.Contains(string(attRes), "not_found_error") {
+		t.Errorf("upstream-response-attempt-2.log must record the 404: %v\n%s", err, attRes)
+	}
+	upRes, _ := os.ReadFile(filepath.Join(dir, "upstream-response.log"))
+	if !strings.Contains(string(upRes), "converted") {
+		t.Error("main upstream-response.log should hold the conversion response")
+	}
+}
+
+func TestMessagesNoPassthroughByDefault(t *testing.T) {
+	up, requests := messagesPassthroughUpstream(t, 200)
+	h := NewHandler(testConfig(up.URL))
+	postMessages(t, h, `{"model":"anything","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+	got := requests()
+	if len(got) != 1 || !strings.HasPrefix(got[0], "/chat/completions ") {
+		t.Errorf("default flow must convert, got %v", got)
+	}
+}

@@ -148,6 +148,8 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--image-caption-cache-ttl` | `24h` | How long a caption is reused for the same image across turns/retries; `0` disables caching |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--reasoning-replay` | `think_tags` | How assistant thinking blocks are replayed upstream: `think_tags`, `reasoning_content`, or `disabled`. Accepts a bare mode (global default) or `glob=mode` per-model rules (repeatable, first match wins); see below |
+| `--pass-through-included` | — | Comma-separated model globs whose `/v1/messages` requests are relayed verbatim to the upstream `/v1/messages` endpoint (whitelist: only listed models pass through). Mutually exclusive with `--pass-through-excluded`; a 404 from upstream falls back to conversion. Dump logs are written either way |
+| `--pass-through-excluded` | — | Comma-separated model globs that are always converted (blacklist: every other model is passed through to upstream `/v1/messages`). Alias `--pass-throuth-excluded` accepted. Mutually exclusive with `--pass-through-included`; a 404 from upstream falls back to conversion. Dump logs are written either way |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
 | `--dump-retention-days` | `3` | Prune dump sessions older than this many days (once at startup, then hourly); only effective when `--dump` is set, `0` disables pruning |
 | `--enable-web-search` | `false` | Enable proxy-side web search |

@@ -140,6 +140,17 @@ type Config struct {
 	// (keyed by content hash) across turns, retries, and response-store
 	// expansion. 0 disables caching.
 	ImageCaptionCacheTTL time.Duration
+
+	// PassThroughIncluded / PassThroughExcluded are comma-separated model globs
+	// selecting which /v1/messages requests are relayed verbatim to the
+	// upstream /v1/messages endpoint instead of being converted to
+	// /chat/completions. Included is a whitelist (only matching models pass
+	// through); excluded is a blacklist (matching models are always converted,
+	// everything else passes through). The two are mutually exclusive. A 404
+	// from the upstream passthrough falls back to conversion. Passthrough
+	// requests still write full dump logs.
+	PassThroughIncluded []string
+	PassThroughExcluded []string
 }
 
 // warn mirrors console.warn (stderr, no timestamp).
@@ -344,6 +355,29 @@ func Load(args []string) *Config {
 		captionTTL = 24 * time.Hour
 	}
 
+	// /v1/messages passthrough model lists: comma-separated globs. The two
+	// flags are mutually exclusive (a whitelist and a blacklist cannot both
+	// define the default) — configuring both is a startup error.
+	splitModels := func(raw string) []string {
+		var out []string
+		for _, p := range strings.Split(raw, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	passThroughIncluded := splitModels(getArg("pass-through-included", ""))
+	passThroughExcluded := splitModels(getArg("pass-through-excluded", ""))
+	if len(passThroughExcluded) == 0 {
+		// Tolerate the misspelled flag variant.
+		passThroughExcluded = splitModels(getArg("pass-throuth-excluded", ""))
+	}
+	if len(passThroughIncluded) > 0 && len(passThroughExcluded) > 0 {
+		fmt.Fprintln(os.Stderr, "fatal: --pass-through-included and --pass-through-excluded are mutually exclusive; set only one")
+		os.Exit(1)
+	}
+
 	return &Config{
 		UpstreamBaseURL:          getArg("upstream-base-url", "https://api.openai.com/v1"),
 		UpstreamAPIKey:           getArg("upstream-api-key", ""),
@@ -368,6 +402,8 @@ func Load(args []string) *Config {
 		ImageCaptionBaseURL:      getArg("image-caption-base-url", ""),
 		ImageCaptionAPIKey:       getArg("image-caption-api-key", ""),
 		ImageCaptionCacheTTL:     captionTTL,
+		PassThroughIncluded:      passThroughIncluded,
+		PassThroughExcluded:      passThroughExcluded,
 	}
 }
 
@@ -406,4 +442,27 @@ func ResolveReasoningReplay(model string, rules []ReasoningReplayRule, fallback 
 		}
 	}
 	return fallback
+}
+
+// ShouldPassThroughMessages reports whether a /v1/messages request for model
+// should be relayed verbatim to the upstream /v1/messages endpoint instead of
+// being converted to /chat/completions. included is a whitelist (only matching
+// models pass through); when it is empty, excluded acts as a blacklist
+// (matching models are converted, everything else passes through). Both empty
+// means no passthrough at all.
+func ShouldPassThroughMessages(model string, included, excluded []string) bool {
+	if len(included) > 0 {
+		for _, p := range included {
+			if GlobMatch(p, model) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, p := range excluded {
+		if GlobMatch(p, model) {
+			return false
+		}
+	}
+	return len(excluded) > 0
 }

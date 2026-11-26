@@ -612,6 +612,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *config.Config, 
 		return
 	}
 
+	// --- Passthrough: models selected by --pass-through-included/excluded are
+	// relayed verbatim to the upstream /v1/messages endpoint (no hooks, no
+	// server-tool agentic loop, no conversion). A 404 from the upstream falls
+	// back to the conversion flow below. Full dump logs are written either way. ---
+	if config.ShouldPassThroughMessages(req.Model, cfg.PassThroughIncluded, cfg.PassThroughExcluded) {
+		if handleMessagesPassthrough(w, r, cfg, session, requestStart, rawBody, apiKey) {
+			return
+		}
+		// Upstream 404 on the passthrough attempt: continue with conversion.
+	}
+
 	// Request hooks run after validation and before conversion: eviction
 	// caps images for the upstream channel, then the caption hook replaces
 	// images with vision-model captions for models the operator ruled
@@ -850,6 +861,109 @@ loop:
 	_ = upstreamRes.Body.Close()
 	<-pumpDone
 	finalizeDump()
+}
+
+// handleMessagesPassthrough relays a /v1/messages request verbatim to the
+// upstream /v1/messages endpoint for models selected by
+// --pass-through-included/--pass-through-excluded (no hooks, no conversion).
+// It returns true when the request was fully handled (response relayed or an
+// error answered, dump session finished) and false only when the upstream
+// answered 404, in which case the caller falls back to the conversion flow.
+// The raw downstream body is forwarded unchanged; every outcome is written to
+// the dump session either way.
+func handleMessagesPassthrough(w http.ResponseWriter, r *http.Request, cfg *config.Config, session *dump.Session, requestStart time.Time, rawBody []byte, apiKey string) bool {
+	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/v1/messages"
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(rawBody))
+	if err != nil {
+		session.Finish()
+		writeJSON(w, http.StatusInternalServerError, serverError(err.Error()))
+		return true
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+	if v := r.Header.Get("Anthropic-Version"); v != "" {
+		upstreamReq.Header.Set("Anthropic-Version", v)
+	}
+	upstreamReqHeaders := headerMap(upstreamReq.Header)
+	session.WriteUpstreamRequest(upstreamReqHeaders, time.Now().UTC().Format(time.RFC3339), string(rawBody))
+
+	client := &http.Client{}
+	upstreamRes, err := client.Do(upstreamReq)
+	if err != nil {
+		handleUpstreamConnectError(w, session, r, requestStart, err)
+		return true
+	}
+	defer upstreamRes.Body.Close()
+	ttfb := time.Since(requestStart).Milliseconds()
+	upstreamHeaders := headerMap(upstreamRes.Header)
+	upstreamStatus := upstreamRes.StatusCode
+
+	// A 404 means the upstream has no native /v1/messages route: keep the
+	// evidence in the numbered attempt logs (the conversion flow below
+	// overwrites the main upstream logs) and let the caller convert instead.
+	if upstreamStatus == http.StatusNotFound {
+		body, _ := io.ReadAll(upstreamRes.Body)
+		session.WriteUpstreamAttemptRequest(2, upstreamReqHeaders, time.Now().UTC().Format(time.RFC3339), string(rawBody))
+		session.WriteUpstreamAttemptResponse(2, upstreamHeaders, upstreamStatus, string(body))
+		fmt.Fprintln(os.Stderr, "chat-to-messages: upstream /v1/messages returned 404, falling back to conversion")
+		return false
+	}
+
+	ct := upstreamRes.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	isSSE := strings.Contains(ct, "text/event-stream")
+	downstreamHeaders := map[string]string{"Content-Type": ct, "Access-Control-Allow-Origin": "*"}
+	if isSSE {
+		for k, v := range upstreamSSEHeaders {
+			downstreamHeaders[k] = v
+		}
+	}
+
+	termination := &dump.Termination{Reason: dump.Completed}
+	var rawUpstream strings.Builder
+	if upstreamStatus < 200 || upstreamStatus >= 300 {
+		body, _ := io.ReadAll(upstreamRes.Body)
+		rawUpstream.Write(body)
+		termination = &dump.Termination{Reason: dump.UpstreamError, DisconnectTime: time.Now().UTC().Format(time.RFC3339)}
+		relayPassthroughResponse(w, upstreamStatus, downstreamHeaders, rawUpstream.String())
+	} else {
+		// Relay verbatim (status, headers, body — SSE included) while teeing
+		// the raw bytes into the dump log.
+		w.Header().Set("Content-Type", ct)
+		if isSSE {
+			for k, v := range upstreamSSEHeaders {
+				w.Header().Set(k, v)
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(upstreamStatus)
+		tee := io.TeeReader(upstreamRes.Body, &rawUpstream)
+		if flusher, ok := w.(http.Flusher); ok {
+			_, _ = io.Copy(flushWriter{w: w, f: flusher}, tee)
+		} else {
+			_, _ = io.Copy(w, tee)
+		}
+		if r.Context().Err() != nil {
+			termination = &dump.Termination{Reason: dump.ClientAbort, DisconnectTime: time.Now().UTC().Format(time.RFC3339)}
+		}
+	}
+	session.WriteUpstreamResponse(upstreamHeaders, upstreamStatus, rawUpstream.String(), termination)
+	session.WriteDownstreamResponse(downstreamHeaders, upstreamStatus, rawUpstream.String(), termination)
+	session.SetTiming(ttfb, time.Since(requestStart).Milliseconds())
+	session.Finish()
+	return true
+}
+
+// relayPassthroughResponse writes an already-fully-read upstream response to
+// the downstream client verbatim (used for the non-2xx passthrough branch).
+func relayPassthroughResponse(w http.ResponseWriter, status int, headers map[string]string, body string) {
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
 }
 
 // writeEvent appends one SSE event to the downstream chunk log and writes it
